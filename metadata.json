@@ -1,0 +1,6 @@
+{
+  "name": "OneDrive Archiver",
+  "description": "Securely download and sync your entire OneDrive to a local folder with integrity verification and resume support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
