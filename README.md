@@ -200,4 +200,3 @@ npm test
 - `SESSION_SECRET` must be a strong unique value in production.
 - `MICROSOFT_CLIENT_SECRET` must be the secret **Value** from Azure.
 - Public deployments should use HTTPS so secure session cookies work correctly.
-- Existing `.syncpoint-manifests` files created by older builds can be deleted from archive folders. Current builds store repair metadata in browser storage instead.
