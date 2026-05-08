@@ -8,6 +8,7 @@ import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import session from 'express-session';
 import { randomBytes, timingSafeEqual } from 'crypto';
+import { ServerDownloadManager } from './src/server/serverDownloadEngine.ts';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -30,6 +31,8 @@ const SESSION_SECRET = process.env.SESSION_SECRET || FALLBACK_SESSION_SECRET;
 const isDevelopment = process.env.NODE_ENV !== 'production';
 const isSecureAppUrl = APP_URL.startsWith('https://');
 const appOrigin = new URL(APP_URL).origin;
+const SERVER_DOWNLOAD_ROOT = process.env.SERVER_DOWNLOAD_ROOT;
+const serverDownloads = new ServerDownloadManager(SERVER_DOWNLOAD_ROOT);
 let msalClient: msal.ConfidentialClientApplication | null = null;
 
 if (!isDevelopment && (!process.env.SESSION_SECRET || SESSION_SECRET === FALLBACK_SESSION_SECRET)) {
@@ -107,6 +110,7 @@ async function startServer() {
     const app = express();
     const PORT = 3000;
 
+    app.use(express.json({ limit: '1mb' }));
     app.use(cookieParser());
     app.set('trust proxy', 1);
     app.use(session({
@@ -180,6 +184,72 @@ async function startServer() {
             res.json({ ok: true });
         });
     });
+
+    function requireServerDownloadRoot(res: express.Response) {
+        if (!SERVER_DOWNLOAD_ROOT) {
+            res.status(400).json({ error: 'SERVER_DOWNLOAD_ROOT is not configured on this server.' });
+            return false;
+        }
+        return true;
+    }
+
+    async function requireAccessToken(req: express.Request, res: express.Response) {
+        try {
+            const accessToken = await refreshSessionToken(req);
+            if (!isUsableAccessToken(accessToken)) {
+                res.status(401).json({ error: 'Sign in to Microsoft before starting server-side downloads.' });
+                return null;
+            }
+            return accessToken;
+        } catch {
+            res.status(401).json({ error: 'Microsoft session expired. Sign in again.' });
+            return null;
+        }
+    }
+
+    app.get('/api/server-jobs/config', (_req, res) => {
+        res.json({
+            configured: Boolean(SERVER_DOWNLOAD_ROOT),
+            targetRoot: SERVER_DOWNLOAD_ROOT || null,
+        });
+    });
+
+    app.get('/api/server-jobs', (_req, res) => {
+        res.json({ jobs: serverDownloads.listJobs() });
+    });
+
+    app.get('/api/server-jobs/:id', (req, res) => {
+        const job = serverDownloads.getJob(req.params.id);
+        if (!job) return res.status(404).json({ error: 'Server job not found.' });
+        res.json({ job });
+    });
+
+    app.post('/api/server-jobs/:id/cancel', (req, res) => {
+        const cancelled = serverDownloads.cancel(req.params.id);
+        if (!cancelled) return res.status(404).json({ error: 'Server job not found.' });
+        res.json({ ok: true });
+    });
+
+    async function startServerJob(req: express.Request, res: express.Response, mode: 'start' | 'dry-run' | 'repair') {
+        if (!requireServerDownloadRoot(res)) return;
+        const accessToken = await requireAccessToken(req, res);
+        if (!accessToken) return;
+        const selections = Array.isArray(req.body?.selections) ? req.body.selections : [];
+        if (selections.length === 0) {
+            return res.status(400).json({ error: 'Select OneDrive files or folders before starting a server job.' });
+        }
+        const getAccessToken = async () => refreshSessionToken(req);
+        try {
+            const job = serverDownloads.start(mode, selections, req.body?.settings || {}, getAccessToken);
+            res.json({ job });
+        } catch (error) {
+            res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+        }
+    }
+
+    app.post('/api/server-jobs/start', (req, res) => startServerJob(req, res, 'start'));
+    app.post('/api/server-jobs/dry-run', (req, res) => startServerJob(req, res, 'dry-run'));
+    app.post('/api/server-jobs/repair', (req, res) => startServerJob(req, res, 'repair'));
 
     app.get('/api/auth/url', async (req, res) => {
         console.log('[AUTH-DEBUG] Generating auth URL');

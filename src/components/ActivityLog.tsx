@@ -1,4 +1,4 @@
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, RotateCcw } from 'lucide-react';
 
 interface LogEntry {
   id: string;
@@ -20,9 +20,12 @@ interface FailedFile {
 interface ActivityLogProps {
   logs: LogEntry[];
   failedFiles: FailedFile[];
+  isSyncing: boolean;
+  canRetry: boolean;
+  onRetryFile: (id: string) => void;
 }
 
-export function ActivityLog({ logs, failedFiles }: ActivityLogProps) {
+export function ActivityLog({ logs, failedFiles, isSyncing, canRetry, onRetryFile }: ActivityLogProps) {
   return (
     <div className="flex-1 border border-slate-200 dark:border-neutral-700 rounded overflow-hidden flex flex-col bg-white dark:bg-neutral-900">
       {failedFiles.length > 0 && (
@@ -33,10 +36,20 @@ export function ActivityLog({ logs, failedFiles }: ActivityLogProps) {
           </div>
           <div className="space-y-2 max-h-36 overflow-y-auto">
             {failedFiles.map(file => (
-              <div key={file.id} className="text-xs grid grid-cols-12 gap-3">
-                <div className="col-span-4 font-semibold text-red-900 dark:text-red-200 truncate" title={file.name}>{file.name}</div>
-                <div className="col-span-4 text-red-700 dark:text-red-300 truncate" title={file.path}>{file.path}</div>
+              <div key={file.id} className="text-xs grid grid-cols-12 gap-3 items-center">
+                <div className="col-span-3 font-semibold text-red-900 dark:text-red-200 truncate" title={file.name}>{file.name}</div>
+                <div className="col-span-3 text-red-700 dark:text-red-300 truncate" title={file.path}>{file.path}</div>
                 <div className="col-span-4 text-red-600 dark:text-red-400 truncate" title={file.reason}>{file.reason}</div>
+                <div className="col-span-2 flex justify-end">
+                  <button
+                    onClick={() => onRetryFile(file.id)}
+                    disabled={isSyncing || !canRetry}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded border border-red-200 bg-white text-red-700 hover:bg-red-100 disabled:opacity-40 disabled:hover:bg-white dark:border-red-900 dark:bg-neutral-900 dark:text-red-300 dark:hover:bg-red-950"
+                    title="Retry this file"
+                  >
+                    <RotateCcw size={13} />
+                  </button>
+                </div>
               </div>
             ))}
           </div>

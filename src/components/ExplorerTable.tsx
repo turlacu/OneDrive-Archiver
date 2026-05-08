@@ -15,6 +15,7 @@ interface ExplorerTableProps {
   isSyncing: boolean;
   itemsError: string | null;
   rootItemsLength: number;
+  emptyMessage: string;
   visibleItems: ExplorerItem[];
   selection: Set<string>;
   rowHeight: number;
@@ -32,6 +33,7 @@ export function ExplorerTable({
   isSyncing,
   itemsError,
   rootItemsLength,
+  emptyMessage,
   visibleItems,
   selection,
   rowHeight,
@@ -81,7 +83,7 @@ export function ExplorerTable({
         ) : rootItemsLength === 0 ? (
           <div className="h-full flex flex-col items-center justify-center p-12 text-center text-slate-400 dark:text-neutral-500">
             <Folder size={48} className="opacity-10 mb-4" />
-            <p className="text-sm font-medium">This folder is empty</p>
+            <p className="text-sm font-medium">{emptyMessage}</p>
           </div>
         ) : (
           <>

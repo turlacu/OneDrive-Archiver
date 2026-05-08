@@ -23,6 +23,21 @@ export class FileCommitter {
     }
   }
 
+  async getExistingFileByPath(root: FileSystemDirectoryHandle, localPath: string) {
+    const parts = localPath.split('/').filter(Boolean);
+    const name = parts.pop();
+    if (!name) return undefined;
+    let directory = root;
+    for (const part of parts) {
+      try {
+        directory = await directory.getDirectoryHandle(normalizePathSegment(part));
+      } catch {
+        return undefined;
+      }
+    }
+    return this.getExistingFile(directory, name);
+  }
+
   async getPartialFile(directory: FileSystemDirectoryHandle, name: string) {
     try {
       const handle = await directory.getFileHandle(`${normalizePathSegment(name)}.partial`);
@@ -122,5 +137,20 @@ export class FileCommitter {
     } catch {
       // Best-effort cleanup; stale partial tracking remains in IndexedDB.
     }
+  }
+
+  async clearPartialByPath(root: FileSystemDirectoryHandle, localPath: string) {
+    const parts = localPath.split('/').filter(Boolean);
+    const name = parts.pop();
+    if (!name) return;
+    let directory = root;
+    for (const part of parts) {
+      try {
+        directory = await directory.getDirectoryHandle(normalizePathSegment(part));
+      } catch {
+        return;
+      }
+    }
+    await this.clearPartial(directory, name);
   }
 }

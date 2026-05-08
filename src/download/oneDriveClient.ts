@@ -56,6 +56,18 @@ export class OneDriveClient {
     return this.readPagedItems(endpoint, onPage);
   }
 
+  async searchItems(
+    folderId: string,
+    query: string,
+    onPage?: (items: GraphDriveItem[]) => void,
+  ) {
+    const escapedQuery = query.replaceAll("'", "''");
+    const endpoint = folderId === 'root'
+      ? `/me/drive/root/search(q='${escapedQuery}')`
+      : `/me/drive/items/${folderId}/search(q='${escapedQuery}')`;
+    return this.readPagedItems(endpoint, onPage);
+  }
+
   async getItem(itemId: string) {
     const response = await this.withAuthRetry(() => this.graphClient.api(`/me/drive/items/${itemId}`).get());
     return this.normalizeItem(response);
@@ -80,7 +92,7 @@ export class OneDriveClient {
   }
 
   async delta(driveId: string, token?: string) {
-    const endpoint = token || `/drives/${driveId}/root/delta`;
+    const endpoint = token || (driveId === 'me' ? '/me/drive/root/delta' : `/drives/${driveId}/root/delta`);
     let response = await this.withAuthRetry(() => this.graphClient.api(endpoint).select(selectFields).top(200).get());
     const items: RemoteItemMetadata[] = [];
     let deltaToken: string | undefined;

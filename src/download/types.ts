@@ -15,6 +15,16 @@ export type DownloadJobStatus =
   | 'cancelled';
 
 export type ConflictStrategy = 'skip_existing' | 'overwrite' | 'rename_new' | 'keep_newest' | 'keep_both';
+export type DownloadRunMode = 'normal' | 'dry_run' | 'incremental' | 'repair';
+export type ManifestItemStatus =
+  | 'completed'
+  | 'skipped'
+  | 'failed'
+  | 'cancelled'
+  | 'remote_changed'
+  | 'missing_local'
+  | 'verified'
+  | 'unverified';
 
 export interface DownloadSettings {
   conflictStrategy: ConflictStrategy;
@@ -98,6 +108,43 @@ export interface DownloadSummary {
   changedRemotely: number;
   conflicts: number;
   insufficientDiskSpace: number;
+}
+
+export interface RunManifestItem {
+  runId: string;
+  itemId: string;
+  driveId: string;
+  name: string;
+  remotePath: string;
+  localPath: string;
+  size: number;
+  eTag?: string;
+  cTag?: string;
+  lastModifiedDateTime?: string;
+  sha1Hash?: string;
+  quickXorHash?: string;
+  status: ManifestItemStatus;
+  verification?: string;
+  error?: string;
+  finalName?: string;
+  updatedAt: string;
+}
+
+export interface RunManifest {
+  runId: string;
+  mode: DownloadRunMode;
+  source: 'OneDrive';
+  targetFolderName: string;
+  startedAt: string;
+  finishedAt: string;
+  settings: DownloadSettings;
+  summary: DownloadSummary & {
+    totalFiles: number;
+    totalBytes: number;
+    completedFiles: number;
+    failedFiles: number;
+  };
+  items: RunManifestItem[];
 }
 
 export interface DownloadProgressSnapshot {

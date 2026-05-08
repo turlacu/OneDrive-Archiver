@@ -7,7 +7,10 @@ import {
   ChevronRight,
   HardDrive,
   Moon,
-  Sun
+  RotateCcw,
+  Search,
+  Sun,
+  X
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import axios from 'axios';
@@ -15,6 +18,7 @@ import { Client } from '@microsoft/microsoft-graph-client';
 import { ActivityLog } from './components/ActivityLog';
 import { ExplorerTable } from './components/ExplorerTable';
 import { DownloadEngine, type SourceSelection } from './download/downloadEngine';
+import { FileCommitter } from './download/fileCommitter';
 import { DownloadJobStore } from './download/jobStore';
 import { OneDriveClient } from './download/oneDriveClient';
 import { defaultDownloadSettings, type DownloadProgressSnapshot, type DownloadSettings, type ReporterEvent } from './download/types';
@@ -83,6 +87,15 @@ interface FailedFile {
   reason: string;
 }
 
+interface ServerArchiveJob {
+  id: string;
+  mode: 'start' | 'dry-run' | 'repair';
+  status: 'queued' | 'scanning' | 'downloading' | 'completed' | 'failed' | 'cancelled';
+  targetRoot: string;
+  log: string[];
+  snapshot: DownloadProgressSnapshot;
+}
+
 export default function App() {
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [user, setUser] = useState<any>(null);
@@ -105,6 +118,12 @@ export default function App() {
   const [resetLogsOnStart, setResetLogsOnStart] = useState(true);
   const [theme, setTheme] = useState<'light' | 'dark'>(() => localStorage.getItem('theme') === 'dark' ? 'dark' : 'light');
   const [tableScrollTop, setTableScrollTop] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeSearchQuery, setActiveSearchQuery] = useState('');
+  const [targetMode, setTargetMode] = useState<'browser' | 'server'>('browser');
+  const [serverTargetRoot, setServerTargetRoot] = useState<string | null>(null);
+  const [serverJobs, setServerJobs] = useState<ServerArchiveJob[]>([]);
+  const [activeServerJobId, setActiveServerJobId] = useState<string | null>(null);
 
   const oneDriveClient = useRef<OneDriveClient | null>(null);
   const downloadEngine = useRef<DownloadEngine | null>(null);
@@ -115,6 +134,12 @@ export default function App() {
     document.documentElement.classList.toggle('dark', theme === 'dark');
     localStorage.setItem('theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    axios.get('/api/server-jobs/config')
+      .then(res => setServerTargetRoot(res.data?.targetRoot || null))
+      .catch(() => setServerTargetRoot(null));
+  }, []);
 
   function isUsableAccessToken(value: string | null | undefined) {
     if (!value) return false;
@@ -276,6 +301,7 @@ export default function App() {
     setSelection(new Set());
     setRootItems([]);
     setTableScrollTop(0);
+    setActiveSearchQuery('');
     try {
       const endpoint = folderId === 'root'
         ? 'root'
@@ -301,6 +327,52 @@ export default function App() {
       if (folderLoadRequestRef.current === requestId) {
         setIsLoadingItems(false);
       }
+    }
+  };
+
+  const searchFolderItems = async () => {
+    const query = searchQuery.trim();
+    if (!query) return;
+    if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
+
+    const requestId = folderLoadRequestRef.current + 1;
+    folderLoadRequestRef.current = requestId;
+    setIsLoadingItems(true);
+    setItemsError(null);
+    setSelection(new Set());
+    setRootItems([]);
+    setTableScrollTop(0);
+    setActiveSearchQuery(query);
+
+    try {
+      const driveItems: GraphDriveItem[] = [];
+      await oneDriveClient.current.searchItems(currentFolder.id, query, page => {
+        if (folderLoadRequestRef.current !== requestId) return;
+        driveItems.push(...page);
+        setRootItems(sortSyncItems(driveItems.map(mapDriveItem)));
+      });
+      if (folderLoadRequestRef.current !== requestId) return;
+
+      const items = sortSyncItems(driveItems.map(mapDriveItem));
+      setRootItems(items);
+      addLog(`Found ${items.length} item${items.length === 1 ? '' : 's'} matching "${query}" in ${currentFolder.name}`);
+    } catch (e) {
+      if (folderLoadRequestRef.current !== requestId) return;
+      const message = (e as any).body?.message || (e as Error).message || 'Microsoft Graph rejected the search request';
+      setItemsError(message);
+      setRootItems([]);
+      addLog(`Search failed: ${message}`);
+    } finally {
+      if (folderLoadRequestRef.current === requestId) {
+        setIsLoadingItems(false);
+      }
+    }
+  };
+
+  const clearSearch = () => {
+    setSearchQuery('');
+    if (activeSearchQuery) {
+      fetchFolderItems(currentFolder.id, currentFolder.name);
     }
   };
 
@@ -414,8 +486,8 @@ export default function App() {
       const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
       const permission = await ensureDirectoryPermission(handle);
       if (!permission) {
-        alert('Write permission is required to download files into the selected folder.');
-        addLog(`Write permission denied for local folder: ${handle.name}`);
+        alert('The selected folder could not be used for writing. Choose a local folder again and allow access.');
+        addLog(`Local folder could not be used: ${handle.name}`);
         return;
       }
 
@@ -427,21 +499,73 @@ export default function App() {
   };
 
   const ensureDirectoryPermission = async (handle: FileSystemDirectoryHandle): Promise<boolean> => {
-    const writableHandle = handle as FileSystemDirectoryHandle & {
-      queryPermission?: (descriptor: { mode: 'readwrite' }) => Promise<PermissionState>;
-      requestPermission?: (descriptor: { mode: 'readwrite' }) => Promise<PermissionState>;
-    };
+    try {
+      const writableHandle = handle as FileSystemDirectoryHandle & {
+        queryPermission?: (descriptor: { mode: 'readwrite' }) => Promise<PermissionState>;
+        requestPermission?: (descriptor: { mode: 'readwrite' }) => Promise<PermissionState>;
+      };
 
-    if (!writableHandle.queryPermission || !writableHandle.requestPermission) {
-      return true;
+      if (!writableHandle.queryPermission || !writableHandle.requestPermission) {
+        return await probeDirectoryAccess(handle);
+      }
+
+      const permission = await writableHandle.queryPermission({ mode: 'readwrite' });
+      if (permission === 'granted') {
+        return await probeDirectoryAccess(handle);
+      }
+
+      const requested = await writableHandle.requestPermission({ mode: 'readwrite' });
+      return requested === 'granted' && await probeDirectoryAccess(handle);
+    } catch (error) {
+      if (isInvalidDirectoryHandleError(error)) {
+        setLocalDir(null);
+        addLog('The selected local folder handle could not be used. Choose the folder again and retry.');
+        return false;
+      }
+      throw error;
     }
+  };
 
-    const permission = await writableHandle.queryPermission({ mode: 'readwrite' });
-    if (permission === 'granted') {
+  const probeDirectoryAccess = async (handle: FileSystemDirectoryHandle) => {
+    const probeName = `.syncpoint-access-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`;
+    try {
+      const probe = await handle.getFileHandle(probeName, { create: true });
+      const writable = await probe.createWritable();
+      await writable.write('ok');
+      await writable.close();
+      await handle.removeEntry(probeName);
       return true;
+    } catch (error) {
+      try {
+        await handle.removeEntry(probeName);
+      } catch {
+        // Best-effort cleanup for failed access probes.
+      }
+      if (isInvalidDirectoryHandleError(error)) {
+        setLocalDir(null);
+        addLog('The selected local folder handle could not be used. Choose the folder again and retry.');
+        return false;
+      }
+      throw error;
     }
+  };
 
-    return await writableHandle.requestPermission({ mode: 'readwrite' }) === 'granted';
+  const isInvalidDirectoryHandleError = (error: unknown) => {
+    const name = error instanceof DOMException ? error.name : '';
+    const message = error instanceof Error ? error.message : String(error);
+    return name === 'NotAllowedError'
+      || name === 'NotFoundError'
+      || message.includes('FileSystem')
+      || message.includes('directory handle');
+  };
+
+  const operationErrorMessage = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isInvalidDirectoryHandleError(error)) {
+      setLocalDir(null);
+      return `A browser object handle failed (${message}). Choose the local folder again and retry.`;
+    }
+    return message;
   };
 
   const addLog = (message: string, stage = 'app', details?: Partial<LogEntry>) => {
@@ -454,6 +578,21 @@ export default function App() {
     };
     setLogs(prev => [entry, ...prev]);
   };
+
+  const refreshServerJobs = async () => {
+    try {
+      const res = await axios.get('/api/server-jobs');
+      setServerJobs(res.data?.jobs || []);
+    } catch {
+      // Server-side downloads are optional.
+    }
+  };
+
+  useEffect(() => {
+    refreshServerJobs();
+    const interval = setInterval(refreshServerJobs, 2000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleEngineEvent = (event: ReporterEvent) => {
     if (event.type === 'log') {
@@ -558,7 +697,7 @@ export default function App() {
       }));
       await engine.start(selections, localDir.handle);
     } catch (e) {
-      addLog(`Sync failed: ${(e as Error).message}`);
+      addLog(`Sync failed: ${operationErrorMessage(e)}`);
     } finally {
       setIsSyncing(false);
       setDownloadSpeed(0);
@@ -567,10 +706,153 @@ export default function App() {
     }
   };
 
-  const retryFailedDownloads = async () => {
+  const dryRunSelected = async () => {
+    if (!localDir) return alert('Select a local folder first');
+    if (selection.size === 0) return alert('Select items to preflight');
+    if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
+    if (!await ensureDirectoryPermission(localDir.handle)) {
+      alert('Read/write permission is required to inspect the selected target folder. Choose the folder again and allow access.');
+      addLog(`Permission missing for local folder: ${localDir.name}`);
+      return;
+    }
+
+    setIsSyncing(true);
+    setDownloadSpeed(0);
+    setActiveFiles([]);
+    if (resetLogsOnStart) setLogs([]);
+
+    const itemsToProcess = rootItems.filter(i => selection.has(i.id));
+    addLog(`Preflighting ${itemsToProcess.length} selected item${itemsToProcess.length === 1 ? '' : 's'}...`);
+
+    try {
+      const engine = new DownloadEngine(oneDriveClient.current, handleEngineEvent, downloadSettings);
+      downloadEngine.current = engine;
+      const selections: SourceSelection[] = itemsToProcess.map(item => ({
+        id: item.id,
+        name: item.name,
+        type: item.type,
+      }));
+      await engine.dryRun(selections, localDir.handle);
+    } catch (e) {
+      addLog(`Dry run failed: ${operationErrorMessage(e)}`);
+    } finally {
+      setIsSyncing(false);
+      setDownloadSpeed(0);
+      setActiveFiles([]);
+      downloadEngine.current = null;
+    }
+  };
+
+  const startIncrementalArchive = async () => {
     if (!localDir) return alert('Select a local folder first');
     if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
-    if (failedFiles.length === 0) return;
+    if (!await ensureDirectoryPermission(localDir.handle)) {
+      alert('Write permission is required to archive changed files into the selected folder. Choose the folder again and allow access.');
+      addLog(`Write permission missing for local folder: ${localDir.name}`);
+      return;
+    }
+
+    setIsSyncing(true);
+    setDownloadSpeed(0);
+    setActiveFiles([]);
+    setFailedFiles([]);
+    if (resetLogsOnStart) setLogs([]);
+    addLog('Starting incremental archive from OneDrive delta state...');
+
+    try {
+      const engine = new DownloadEngine(oneDriveClient.current, handleEngineEvent, downloadSettings);
+      downloadEngine.current = engine;
+      await engine.startIncremental(localDir.handle);
+    } catch (e) {
+      addLog(`Incremental archive failed: ${operationErrorMessage(e)}`);
+    } finally {
+      setIsSyncing(false);
+      setDownloadSpeed(0);
+      setActiveFiles([]);
+      downloadEngine.current = null;
+    }
+  };
+
+  const repairArchive = async () => {
+    if (!localDir) return alert('Select a local folder first');
+    if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
+    if (!await ensureDirectoryPermission(localDir.handle)) {
+      alert('Write permission is required to repair files in the selected folder. Choose the folder again and allow access.');
+      addLog(`Write permission missing for local folder: ${localDir.name}`);
+      return;
+    }
+
+    setIsSyncing(true);
+    setDownloadSpeed(0);
+    setActiveFiles([]);
+    setFailedFiles([]);
+    if (resetLogsOnStart) setLogs([]);
+    addLog(selection.size > 0
+      ? 'Checking selected OneDrive items for missing or changed local files...'
+      : 'Checking latest saved archive manifest for missing or changed local files...');
+
+    try {
+      const engine = new DownloadEngine(oneDriveClient.current, handleEngineEvent, downloadSettings);
+      downloadEngine.current = engine;
+      if (selection.size > 0) {
+        const itemsToProcess = rootItems.filter(i => selection.has(i.id));
+        const selections: SourceSelection[] = itemsToProcess.map(item => ({
+          id: item.id,
+          name: item.name,
+          type: item.type,
+        }));
+        await engine.repairSelections(selections, localDir.handle);
+      } else {
+        await engine.repairFromLatestManifest(localDir.handle);
+      }
+    } catch (e) {
+      addLog(`Repair failed: ${operationErrorMessage(e)}`);
+    } finally {
+      setIsSyncing(false);
+      setDownloadSpeed(0);
+      setActiveFiles([]);
+      downloadEngine.current = null;
+    }
+  };
+
+  const selectedSourceSelections = () => {
+    const itemsToProcess = rootItems.filter(i => selection.has(i.id));
+    return itemsToProcess.map(item => ({
+      id: item.id,
+      name: item.name,
+      type: item.type,
+    }));
+  };
+
+  const startServerArchiveJob = async (mode: 'start' | 'dry-run' | 'repair') => {
+    if (!serverTargetRoot) return alert('SERVER_DOWNLOAD_ROOT is not configured on the server.');
+    if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
+    if (selection.size === 0) return alert('Select OneDrive files or folders first');
+    const endpoint = mode === 'start'
+      ? '/api/server-jobs/start'
+      : mode === 'dry-run'
+        ? '/api/server-jobs/dry-run'
+        : '/api/server-jobs/repair';
+    addLog(`Starting server ${mode === 'start' ? 'archive' : mode} job...`);
+    try {
+      const res = await axios.post(endpoint, {
+        selections: selectedSourceSelections(),
+        settings: downloadSettings,
+      });
+      const job = res.data?.job as ServerArchiveJob;
+      setActiveServerJobId(job.id);
+      await refreshServerJobs();
+      addLog(`Server job started: ${job.id}`);
+    } catch (error: any) {
+      addLog(error.response?.data?.error || `Server job failed to start: ${error.message}`);
+    }
+  };
+
+  const retryFailedDownloads = async (jobIds?: string[]) => {
+    if (!localDir) return alert('Select a local folder first');
+    if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
+    const failedJobIds = jobIds || failedFiles.map(file => file.id);
+    if (failedJobIds.length === 0) return;
     if (!await ensureDirectoryPermission(localDir.handle)) {
       alert('Write permission is required to retry downloads into the selected folder. Choose the folder again and allow access.');
       addLog(`Write permission missing for local folder: ${localDir.name}`);
@@ -581,7 +863,6 @@ export default function App() {
     setDownloadSpeed(0);
     setActiveFiles([]);
 
-    const failedJobIds = failedFiles.map(file => file.id);
     addLog(`Retrying ${failedJobIds.length} failed file${failedJobIds.length === 1 ? '' : 's'}...`);
 
     try {
@@ -589,7 +870,7 @@ export default function App() {
       downloadEngine.current = engine;
       await engine.retryJobs(failedJobIds, localDir.handle);
     } catch (e) {
-      addLog(`Retry failed: ${(e as Error).message}`);
+      addLog(`Retry failed: ${operationErrorMessage(e)}`);
     } finally {
       setIsSyncing(false);
       setDownloadSpeed(0);
@@ -614,6 +895,22 @@ export default function App() {
     addLog(`Cleaned ${removed} stale saved download job${removed === 1 ? '' : 's'}.`);
   };
 
+  const clearStalePartials = async () => {
+    if (isSyncing) return;
+    if (!localDir) return alert('Select a local folder first');
+    if (!await ensureDirectoryPermission(localDir.handle)) {
+      alert('Write permission is required to remove stale partial files. Choose the folder again and allow access.');
+      addLog(`Write permission missing for local folder: ${localDir.name}`);
+      return;
+    }
+
+    const store = new DownloadJobStore();
+    const jobs = await store.getJobsByStatus(['failed', 'cancelled', 'stale_remote_changed']);
+    const committer = new FileCommitter();
+    await Promise.all(jobs.map(job => committer.clearPartialByPath(localDir.handle, job.localPath)));
+    addLog(`Cleared partial files for ${jobs.length} recoverable job${jobs.length === 1 ? '' : 's'}.`);
+  };
+
   const updateItemStatus = (id: string, status: SyncItem['status'], error?: string) => {
     // This is expensive for large sets, but for root it's fine.
     setRootItems(prev => prev.map(i => i.id === id ? { ...i, status, error } : i));
@@ -624,22 +921,38 @@ export default function App() {
   };
 
   const stopSync = () => {
+    const activeServerJob = serverJobs.find(job => job.id === activeServerJobId);
+    if (targetMode === 'server' && activeServerJob && ['queued', 'scanning', 'downloading'].includes(activeServerJob.status)) {
+      axios.post(`/api/server-jobs/${activeServerJob.id}/cancel`)
+        .then(refreshServerJobs)
+        .catch((error: any) => addLog(error.response?.data?.error || `Cancel failed: ${error.message}`));
+      addLog('Server job cancellation requested.');
+      return;
+    }
     downloadEngine.current?.cancel();
     setIsSyncing(false);
     setActiveFiles([]);
     addLog('Sync cancelled by user');
   };
 
-  const globalProgress = syncStats.size > 0
+  const activeServerJob = serverJobs.find(job => job.id === activeServerJobId)
+    || serverJobs.find(job => ['queued', 'scanning', 'downloading'].includes(job.status));
+  const isServerBusy = targetMode === 'server' && Boolean(activeServerJob && ['queued', 'scanning', 'downloading'].includes(activeServerJob.status));
+  const activeSnapshot = targetMode === 'server' && activeServerJob ? activeServerJob.snapshot : progressSnapshot;
+  const globalProgress = targetMode === 'server' && activeServerJob
+    ? activeServerJob.snapshot.stagePercent
+    : syncStats.size > 0
     ? Math.min((syncStats.downloadedSize / syncStats.size) * 100, 100)
     : 0;
-  const remainingItems = Math.max(syncStats.total - syncStats.completed, 0);
-  const activeStage = progressSnapshot?.status || (isSyncing ? 'downloading' : 'idle');
+  const remainingItems = targetMode === 'server' && activeServerJob
+    ? activeServerJob.snapshot.queuedFiles
+    : Math.max(syncStats.total - syncStats.completed, 0);
+  const activeStage = activeSnapshot?.status || (isSyncing || isServerBusy ? 'downloading' : 'idle');
   const activeStageLabel = activeStage.replaceAll('_', ' ');
   const activeStagePercent = Math.round(
     ['downloading', 'retrying', 'throttled'].includes(activeStage)
       ? globalProgress
-      : progressSnapshot?.stagePercent ?? globalProgress
+      : activeSnapshot?.stagePercent ?? globalProgress
   );
   const rowHeight = 49;
   const tableViewportHeight = 640;
@@ -677,13 +990,18 @@ export default function App() {
                 <span className="text-[10px] font-bold text-blue-700 dark:text-blue-100">{user.displayName?.charAt(0)}</span>
               </div>
               <span className="text-sm font-medium">{user.displayName || user.userPrincipalName}</span>
-              <button onClick={handleLogout} className="ml-2 text-slate-400 dark:text-neutral-500 hover:text-red-500 transition-colors">
+              <button
+                onClick={handleLogout}
+                title="Sign out of the current Microsoft session."
+                className="ml-2 text-slate-400 dark:text-neutral-500 hover:text-red-500 transition-colors"
+              >
                 <LogOut size={14} />
               </button>
             </div>
           ) : (
             <button 
               onClick={handleLogin}
+              title="Sign in with Microsoft so the app can read OneDrive files."
               className="px-6 py-2 bg-blue-600 text-white text-sm font-semibold rounded hover:bg-blue-500 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:border disabled:border-neutral-700 disabled:opacity-100 transition-all flex items-center gap-2"
             >
               <LogIn size={16} />
@@ -707,26 +1025,55 @@ export default function App() {
           </div>
           
           <div>
-            <p className="text-[10px] font-bold text-slate-400 dark:text-neutral-500 uppercase tracking-widest mb-4">Local Target</p>
-            <div 
-              onClick={selectLocalFolder}
-              className={`p-4 border rounded-lg cursor-pointer transition-all ${localDir ? 'border-slate-300 bg-slate-50 dark:bg-neutral-800/60 dark:border-neutral-700' : 'border-slate-200 dark:border-neutral-700 hover:border-slate-400 dark:border-neutral-700 dark:hover:border-neutral-500'}`}
-            >
-              <div className="flex items-center gap-2 mb-1">
-                <HardDrive size={16} className={localDir ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400 dark:text-neutral-500'} />
-                <span className="text-xs font-bold truncate">{localDir ? localDir.name : 'Choose Folder'}</span>
-              </div>
-              <p className="text-[10px] text-slate-500 dark:text-neutral-400 leading-tight">
-                {localDir ? 'Drive Mapped & Ready' : 'Select sync destination'}
-              </p>
+            <p className="text-[10px] font-bold text-slate-400 dark:text-neutral-500 uppercase tracking-widest mb-4">Archive Target</p>
+            <div className="grid grid-cols-2 gap-1 mb-3">
+              <button
+                onClick={() => setTargetMode('browser')}
+                className={`py-1.5 rounded text-[10px] font-bold uppercase ${targetMode === 'browser' ? 'bg-blue-50 dark:bg-neutral-800 text-blue-700 dark:text-neutral-100' : 'text-slate-500 dark:text-neutral-400 border border-slate-200 dark:border-neutral-700'}`}
+                title="Write downloads to a folder selected by this browser."
+              >
+                Browser
+              </button>
+              <button
+                onClick={() => setTargetMode('server')}
+                className={`py-1.5 rounded text-[10px] font-bold uppercase ${targetMode === 'server' ? 'bg-blue-50 dark:bg-neutral-800 text-blue-700 dark:text-neutral-100' : 'text-slate-500 dark:text-neutral-400 border border-slate-200 dark:border-neutral-700'}`}
+                title="Write downloads on the server under SERVER_DOWNLOAD_ROOT."
+              >
+                Server
+              </button>
             </div>
+            {targetMode === 'browser' ? (
+              <div 
+                onClick={selectLocalFolder}
+                title="Choose the local folder where archived files will be written."
+                className={`p-4 border rounded-lg cursor-pointer transition-all ${localDir ? 'border-slate-300 bg-slate-50 dark:bg-neutral-800/60 dark:border-neutral-700' : 'border-slate-200 dark:border-neutral-700 hover:border-slate-400 dark:border-neutral-700 dark:hover:border-neutral-500'}`}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <HardDrive size={16} className={localDir ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400 dark:text-neutral-500'} />
+                  <span className="text-xs font-bold truncate">{localDir ? localDir.name : 'Choose Folder'}</span>
+                </div>
+                <p className="text-[10px] text-slate-500 dark:text-neutral-400 leading-tight">
+                  {localDir ? 'Browser target ready' : 'Select browser destination'}
+                </p>
+              </div>
+            ) : (
+              <div className={`p-4 border rounded-lg ${serverTargetRoot ? 'border-slate-300 bg-slate-50 dark:bg-neutral-800/60 dark:border-neutral-700' : 'border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30'}`}>
+                <div className="flex items-center gap-2 mb-1">
+                  <HardDrive size={16} className={serverTargetRoot ? 'text-blue-600 dark:text-blue-400' : 'text-red-500'} />
+                  <span className="text-xs font-bold truncate">{serverTargetRoot || 'SERVER_DOWNLOAD_ROOT missing'}</span>
+                </div>
+                <p className="text-[10px] text-slate-500 dark:text-neutral-400 leading-tight">
+                  {serverTargetRoot ? 'Server target configured' : 'Set SERVER_DOWNLOAD_ROOT in the server environment'}
+                </p>
+              </div>
+            )}
           </div>
 
           <div className="mt-auto p-4 bg-slate-50 dark:bg-neutral-800 rounded-lg border border-slate-100 dark:border-neutral-800">
             <p className="text-xs text-slate-500 dark:text-neutral-400 leading-tight">
               Status: <br/>
               <span className="font-bold text-slate-700 dark:text-neutral-100 uppercase">
-                {isSyncing ? `${activeStageLabel} ${activeStagePercent}%` : 'Idle / Ready'}
+                {isSyncing || isServerBusy ? `${activeStageLabel} ${activeStagePercent}%` : 'Idle / Ready'}
               </span>
             </p>
           </div>
@@ -765,16 +1112,59 @@ export default function App() {
                       </button>
                     </React.Fragment>
                   ))}
+                  {activeSearchQuery && (
+                    <span className="ml-2 text-blue-600 dark:text-sky-300">
+                      Search: "{activeSearchQuery}"
+                    </span>
+                  )}
                 </div>
               ) : (
                 <div className="mt-2 text-xs text-slate-500 dark:text-neutral-400">{logs.length} log entries retained for this session</div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex items-center gap-2">
               {mainTab === 'explorer' ? (
                 <>
+                  <form
+                    onSubmit={event => {
+                      event.preventDefault();
+                      searchFolderItems();
+                    }}
+                    className="flex items-center"
+                  >
+                    <div className="flex h-8 items-center rounded border border-slate-200 bg-white dark:border-neutral-700 dark:bg-neutral-900">
+                      <Search size={14} className="ml-2 text-slate-400 dark:text-neutral-500" />
+                      <input
+                        value={searchQuery}
+                        onChange={event => setSearchQuery(event.target.value)}
+                        disabled={!accessToken || isLoadingItems || isSyncing}
+                        placeholder="Search files"
+                        className="h-full w-40 bg-transparent px-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 disabled:text-slate-400 dark:text-neutral-100 dark:placeholder:text-neutral-500"
+                      />
+                      {searchQuery && (
+                        <button
+                          type="button"
+                          onClick={clearSearch}
+                          disabled={isLoadingItems || isSyncing}
+                          className="mr-1 flex h-6 w-6 items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-40 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                          title="Clear search"
+                        >
+                          <X size={13} />
+                        </button>
+                      )}
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={!accessToken || !searchQuery.trim() || isLoadingItems || isSyncing}
+                      className="ml-1 h-8 w-8 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 text-xs font-semibold rounded hover:bg-white dark:hover:bg-neutral-800 dark:bg-neutral-900 transition-colors disabled:text-slate-400 dark:disabled:text-neutral-500 flex items-center justify-center"
+                      title="Search current folder"
+                    >
+                      <Search size={14} />
+                    </button>
+                  </form>
                   <button
                     onClick={() => fetchFolderItems(currentFolder.id)}
+                    title="Reload the current OneDrive folder."
                     className="px-3 py-1 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 text-xs font-semibold rounded hover:bg-white dark:hover:bg-neutral-800 dark:bg-neutral-900 transition-colors disabled:text-slate-400 dark:disabled:text-neutral-500"
                     disabled={!accessToken || isLoadingItems || isSyncing}
                   >
@@ -782,6 +1172,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => setSelection(new Set(rootItems.map(i => i.id)))}
+                    title="Select every visible item in the current folder or search result."
                     className="px-3 py-1 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 text-xs font-semibold rounded hover:bg-white dark:hover:bg-neutral-800 dark:bg-neutral-900 transition-colors disabled:text-slate-400 dark:disabled:text-neutral-500"
                     disabled={!accessToken}
                   >
@@ -789,6 +1180,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => setSelection(new Set())}
+                    title="Clear the current item selection."
                     className="px-3 py-1 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 text-xs font-semibold rounded hover:bg-white dark:hover:bg-neutral-800 dark:bg-neutral-900 transition-colors disabled:text-slate-400 dark:disabled:text-neutral-500"
                     disabled={!accessToken}
                   >
@@ -810,6 +1202,7 @@ export default function App() {
                       setLogs([]);
                       setFailedFiles([]);
                     }}
+                    title="Clear visible logs and the current failed-file list. Saved resume state is not changed."
                     className="px-3 py-1 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 text-xs font-semibold rounded hover:bg-white dark:hover:bg-neutral-800 dark:bg-neutral-900 transition-colors"
                   >
                     Clear Logs
@@ -817,13 +1210,23 @@ export default function App() {
                   <button
                     onClick={cleanupStaleDownloadState}
                     disabled={isSyncing}
+                    title="Delete old completed, skipped, failed, cancelled, and stale saved download jobs from browser storage."
                     className="px-3 py-1 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 text-xs font-semibold rounded hover:bg-white dark:hover:bg-neutral-800 dark:bg-neutral-900 transition-colors disabled:text-slate-400 dark:disabled:text-neutral-500"
                   >
                     Clean Stale State
                   </button>
                   <button
+                    onClick={clearStalePartials}
+                    disabled={isSyncing || !localDir}
+                    title="Remove leftover .partial files for failed, cancelled, or stale jobs in the selected local folder."
+                    className="px-3 py-1 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 text-xs font-semibold rounded hover:bg-white dark:hover:bg-neutral-800 dark:bg-neutral-900 transition-colors disabled:text-slate-400 dark:disabled:text-neutral-500"
+                  >
+                    Clear Partials
+                  </button>
+                  <button
                     onClick={resetStoredDownloadState}
                     disabled={isSyncing}
+                    title="Forget all saved download jobs and resume progress. Completed local files are not deleted."
                     className="px-3 py-1 border border-red-200 dark:border-red-900 text-red-700 dark:text-red-300 text-xs font-semibold rounded hover:bg-red-50 dark:hover:bg-red-950/40 dark:bg-neutral-900 transition-colors disabled:text-slate-400 dark:disabled:text-neutral-500"
                   >
                     Reset Resume State
@@ -841,6 +1244,7 @@ export default function App() {
                 isSyncing={isSyncing}
                 itemsError={itemsError}
                 rootItemsLength={rootItems.length}
+                emptyMessage={activeSearchQuery ? 'No matching files found' : 'This folder is empty'}
                 visibleItems={visibleItems}
                 selection={selection}
                 rowHeight={rowHeight}
@@ -852,7 +1256,13 @@ export default function App() {
                 onRetry={() => fetchFolderItems(currentFolder.id)}
               />
             ) : (
-              <ActivityLog logs={logs} failedFiles={failedFiles} />
+              <ActivityLog
+                logs={logs}
+                failedFiles={failedFiles}
+                isSyncing={isSyncing}
+                canRetry={Boolean(localDir)}
+                onRetryFile={id => retryFailedDownloads([id])}
+              />
             )}
           </div>
         </section>
@@ -865,21 +1275,45 @@ export default function App() {
               <div className="grid grid-cols-2 gap-3">
                 <div className="p-3 bg-slate-50 dark:bg-neutral-800 border border-slate-200 dark:border-neutral-700 rounded">
                   <p className="text-[8px] font-bold text-slate-400 dark:text-neutral-500 uppercase mb-1">Completed</p>
-                  <div className="text-xl font-bold text-slate-800 dark:text-neutral-100">{syncStats.completed}</div>
+                  <div className="text-xl font-bold text-slate-800 dark:text-neutral-100">{targetMode === 'server' && activeServerJob ? activeServerJob.snapshot.completedFiles : syncStats.completed}</div>
                 </div>
                 <div className="p-3 bg-slate-50 dark:bg-neutral-800 border border-slate-200 dark:border-neutral-700 rounded">
                   <p className="text-[8px] font-bold text-slate-400 dark:text-neutral-500 uppercase mb-1">Failures</p>
-                  <div className="text-xl font-bold text-red-600 dark:text-red-400">{syncStats.errors}</div>
+                  <div className="text-xl font-bold text-red-600 dark:text-red-400">{targetMode === 'server' && activeServerJob ? activeServerJob.snapshot.failedFiles : syncStats.errors}</div>
                 </div>
               </div>
+              {targetMode === 'server' && activeServerJob && (
+                <div className="border border-slate-200 dark:border-neutral-700 bg-slate-50 dark:bg-neutral-800 rounded p-3 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[9px] font-bold uppercase text-slate-500 dark:text-neutral-400">Server job</p>
+                    <span className="text-[9px] font-bold uppercase text-blue-600 dark:text-blue-400">{activeServerJob.status}</span>
+                  </div>
+                  <div className="text-[10px] text-slate-500 dark:text-neutral-400 truncate" title={activeServerJob.targetRoot}>{activeServerJob.targetRoot}</div>
+                  <div className="max-h-24 overflow-y-auto space-y-1 font-mono text-[10px] text-slate-600 dark:text-neutral-300">
+                    {activeServerJob.log.slice(0, 5).map((line, index) => (
+                      <div key={`${activeServerJob.id}-${index}`} className="truncate" title={line}>{line}</div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {failedFiles.length > 0 && (
                 <div className="border border-red-100 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 rounded p-3 space-y-2">
                   <p className="text-[9px] font-bold uppercase text-red-700 dark:text-red-300">Failed file details</p>
                   <div className="space-y-2 max-h-28 overflow-y-auto">
                     {failedFiles.map(file => (
-                      <div key={file.id} className="text-xs">
-                        <div className="font-semibold text-red-900 dark:text-red-200 truncate" title={file.name}>{file.name}</div>
-                        <div className="text-red-700 dark:text-red-300 truncate" title={file.reason}>{file.reason}</div>
+                      <div key={file.id} className="text-xs flex items-start gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="font-semibold text-red-900 dark:text-red-200 truncate" title={file.name}>{file.name}</div>
+                          <div className="text-red-700 dark:text-red-300 truncate" title={file.reason}>{file.reason}</div>
+                        </div>
+                        <button
+                          onClick={() => retryFailedDownloads([file.id])}
+                          disabled={isSyncing || !localDir}
+                          className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded border border-red-200 bg-white text-red-700 hover:bg-red-100 disabled:opacity-40 disabled:hover:bg-white dark:border-red-900 dark:bg-neutral-900 dark:text-red-300 dark:hover:bg-red-950"
+                          title="Retry this file"
+                        >
+                          <RotateCcw size={12} />
+                        </button>
                       </div>
                     ))}
                   </div>
@@ -891,7 +1325,7 @@ export default function App() {
                       View full activity
                     </button>
                     <button
-                      onClick={retryFailedDownloads}
+                      onClick={() => retryFailedDownloads()}
                       disabled={isSyncing || !localDir}
                       className="text-[10px] font-bold uppercase text-white bg-red-600 hover:bg-red-700 disabled:opacity-40 disabled:hover:bg-red-600 rounded px-2 py-1"
                     >
@@ -906,9 +1340,9 @@ export default function App() {
               <p className="text-[10px] font-bold text-slate-400 dark:text-neutral-500 uppercase tracking-widest">Global Progress</p>
               <div className="p-4 border border-slate-200 dark:border-neutral-700 rounded bg-white dark:bg-neutral-900 shadow-sm">
               <div className="flex justify-between items-center mb-3">
-                <span className={`text-[10px] font-bold uppercase flex items-center gap-1.5 ${isSyncing ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400 dark:text-neutral-500'}`}>
-                  <span className={`w-2 h-2 rounded-full ${isSyncing ? 'bg-blue-500 animate-pulse' : 'bg-slate-300'}`}></span>
-                  {isSyncing ? `${activeStageLabel} ${activeStagePercent}%` : 'Idle'}
+                <span className={`text-[10px] font-bold uppercase flex items-center gap-1.5 ${isSyncing || isServerBusy ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400 dark:text-neutral-500'}`}>
+                  <span className={`w-2 h-2 rounded-full ${isSyncing || isServerBusy ? 'bg-blue-500 animate-pulse' : 'bg-slate-300'}`}></span>
+                  {isSyncing || isServerBusy ? `${activeStageLabel} ${activeStagePercent}%` : 'Idle'}
                 </span>
                 <span className="text-xs font-mono font-bold">
                   {Math.round(globalProgress)}%
@@ -924,17 +1358,47 @@ export default function App() {
               </div>
 
               <div>
-                {!isSyncing ? (
-                  <button 
-                    onClick={startSync}
-                    disabled={!accessToken || !localDir || selection.size === 0}
-                    className="w-full py-2.5 bg-blue-600 text-white rounded font-bold text-xs uppercase tracking-wider shadow-lg shadow-blue-100 dark:shadow-none hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-500 disabled:border disabled:border-slate-200 dark:disabled:bg-neutral-800 dark:disabled:text-neutral-500 dark:disabled:border-neutral-700 disabled:opacity-100 disabled:shadow-none transition-all"
-                  >
-                    {syncStats.completed > 0 && syncStats.completed < syncStats.total ? 'Resume Sync Process' : 'Start Sync Process'}
-                  </button>
+                {!isSyncing && !isServerBusy ? (
+                  <div className="space-y-2">
+                    <button 
+                      onClick={targetMode === 'server' ? () => startServerArchiveJob('start') : startSync}
+                      disabled={!accessToken || selection.size === 0 || (targetMode === 'browser' ? !localDir : !serverTargetRoot)}
+                      title={targetMode === 'server' ? 'Start a server-side archive job that continues after this browser closes.' : 'Download the selected OneDrive files or folders into the selected local archive folder.'}
+                      className="w-full py-2.5 bg-blue-600 text-white rounded font-bold text-xs uppercase tracking-wider shadow-lg shadow-blue-100 dark:shadow-none hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-500 disabled:border disabled:border-slate-200 dark:disabled:bg-neutral-800 dark:disabled:text-neutral-500 dark:disabled:border-neutral-700 disabled:opacity-100 disabled:shadow-none transition-all"
+                    >
+                      {syncStats.completed > 0 && syncStats.completed < syncStats.total ? 'Resume Archive' : 'Start Archive'}
+                    </button>
+                    <div className="grid grid-cols-3 gap-2">
+                      <button
+                        onClick={targetMode === 'server' ? () => startServerArchiveJob('dry-run') : dryRunSelected}
+                        disabled={!accessToken || selection.size === 0 || (targetMode === 'browser' ? !localDir : !serverTargetRoot)}
+                        title={targetMode === 'server' ? 'Preview the server-side archive job without writing files.' : 'Preview the selected archive run without downloading files.'}
+                        className="min-w-0 px-1 py-2 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 rounded font-bold text-[9px] uppercase leading-tight hover:bg-slate-50 dark:hover:bg-neutral-800 disabled:text-slate-400 dark:disabled:text-neutral-500 whitespace-normal break-words"
+                      >
+                        Dry Run
+                      </button>
+                      <button
+                        onClick={startIncrementalArchive}
+                        disabled={targetMode === 'server' || !accessToken || !localDir}
+                        title={targetMode === 'server' ? 'Server-side incremental archive is not available in this version.' : 'Archive only OneDrive files that changed since the last saved incremental scan.'}
+                        className="min-w-0 px-1 py-2 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 rounded font-bold text-[9px] uppercase leading-tight hover:bg-slate-50 dark:hover:bg-neutral-800 disabled:text-slate-400 dark:disabled:text-neutral-500 whitespace-normal break-words"
+                      >
+                        Incremental
+                      </button>
+                      <button
+                        onClick={targetMode === 'server' ? () => startServerArchiveJob('repair') : repairArchive}
+                        disabled={!accessToken || (targetMode === 'browser' ? !localDir : (!serverTargetRoot || selection.size === 0))}
+                        title={targetMode === 'server' ? 'Server-side repair scans the selected OneDrive items and redownloads missing or size-mismatched files.' : 'With a selection, scan selected OneDrive items and redownload missing/unverified local files. Without a selection, use saved repair records.'}
+                        className="min-w-0 px-1 py-2 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 rounded font-bold text-[9px] uppercase leading-tight hover:bg-slate-50 dark:hover:bg-neutral-800 disabled:text-slate-400 dark:disabled:text-neutral-500 whitespace-normal break-words"
+                      >
+                        Repair
+                      </button>
+                    </div>
+                  </div>
                 ) : (
                   <button 
                     onClick={stopSync}
+                    title="Cancel the current archive operation and keep recoverable resume state."
                     className="w-full py-2.5 bg-white dark:bg-neutral-900 border border-slate-300 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 rounded font-bold text-xs uppercase tracking-wider hover:bg-slate-50 dark:hover:bg-neutral-800 transition-all"
                   >
                     Suspend Download
@@ -1042,7 +1506,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            {isSyncing && (
+            {(isSyncing || isServerBusy) && (
               <div className="flex justify-between text-xs mb-2 text-slate-600 dark:text-neutral-300 font-medium">
                 <span className="capitalize">{activeStageLabel}:</span>
                 <span>{activeStagePercent}%</span>
@@ -1050,11 +1514,11 @@ export default function App() {
             )}
             <div className="flex justify-between text-xs mb-2 text-slate-600 dark:text-neutral-300 font-medium">
               <span>Selected Total:</span>
-              <span>{formatBytes(syncStats.size)}</span>
+              <span>{formatBytes(targetMode === 'server' && activeServerJob ? activeServerJob.snapshot.totalBytes : syncStats.size)}</span>
             </div>
             <div className="flex justify-between text-xs mb-2 text-slate-600 dark:text-neutral-300 font-medium">
               <span>Downloaded:</span>
-              <span>{formatBytes(syncStats.downloadedSize)}</span>
+              <span>{formatBytes(targetMode === 'server' && activeServerJob ? activeServerJob.snapshot.downloadedBytes : syncStats.downloadedSize)}</span>
             </div>
             <div className="flex justify-between text-xs mb-2 text-slate-600 dark:text-neutral-300 font-medium">
               <span>Items in Queue:</span>
@@ -1066,7 +1530,7 @@ export default function App() {
             </div>
             <div className="flex justify-between text-xs mt-2 text-slate-600 dark:text-neutral-300 font-medium">
               <span>ETA:</span>
-              <span>{formatDuration(progressSnapshot?.etaSeconds)}</span>
+              <span>{formatDuration(activeSnapshot?.etaSeconds)}</span>
             </div>
           </div>
         </aside>
@@ -1080,8 +1544,8 @@ export default function App() {
             Microsoft API {accessToken ? 'Connected' : 'Offline'}
           </span>
           <span className="flex items-center gap-2">
-            <span className={`w-1.5 h-1.5 rounded-full ${localDir ? 'bg-green-500' : 'bg-slate-500'}`}></span> 
-            Target Volume {localDir ? 'Mounted' : 'Unassigned'}
+            <span className={`w-1.5 h-1.5 rounded-full ${(targetMode === 'browser' ? localDir : serverTargetRoot) ? 'bg-green-500' : 'bg-slate-500'}`}></span> 
+            Target {targetMode === 'browser' ? (localDir ? 'Browser Mounted' : 'Unassigned') : (serverTargetRoot ? 'Server Ready' : 'Server Missing')}
           </span>
         </div>
         <div className="flex gap-6">

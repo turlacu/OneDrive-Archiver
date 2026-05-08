@@ -3,12 +3,15 @@ import { FileCommitter } from './fileCommitter';
 import { IntegrityVerifier } from './integrityVerifier';
 import { DownloadJobStore } from './jobStore';
 import { OneDriveClient, type GraphDriveItem } from './oneDriveClient';
+import { createManifest, createRunId, manifestItemFromJob } from './runManifest';
 import { extensionOf, isTransientOfficeLockFile, normalizeRelativePath, shouldIncludeFile } from './pathTools';
 import { backoffDelayMs, HttpDownloadError, isTransientStatus, parseRetryAfter, sleep } from './retry';
 import type {
   DownloadChunk,
   DownloadJob,
+  DownloadRunMode,
   DownloadSettings,
+  RunManifestItem,
   RemoteItemMetadata,
   Reporter,
 } from './types';
@@ -52,6 +55,11 @@ export class DownloadEngine {
   private scanProcessed = 0;
   private scanPending = 0;
   private failedJobs = new Map<string, DownloadJob>();
+  private manifestItems = new Map<string, RunManifestItem>();
+  private runId = createRunId();
+  private mode: DownloadRunMode = 'normal';
+  private startedAt = new Date().toISOString();
+  private throttleEvents = 0;
 
   constructor(
     private readonly oneDrive: OneDriveClient,
@@ -81,12 +89,7 @@ export class DownloadEngine {
     selections: SourceSelection[],
     rootDirectory: FileSystemDirectoryHandle,
   ) {
-    this.abortController = new AbortController();
-    this.paused = false;
-    this.resetCounters();
-    this.failedJobs.clear();
-    this.scanProcessed = 0;
-    this.scanPending = selections.length;
+    this.beginRun('normal', selections.length);
 
     this.reporter.log('scanner', `Scanning ${selections.length} selected item${selections.length === 1 ? '' : 's'}...`);
     this.emitProgress('scanning');
@@ -102,12 +105,7 @@ export class DownloadEngine {
     this.counters.queuedFiles = runnableJobs.length;
     this.emitProgress('queued');
 
-    const queue = [...runnableJobs];
-    const workers = Array.from(
-      { length: Math.max(1, this.settings.maxGlobalConcurrentDownloads) },
-      () => this.runWorker(queue, rootDirectory),
-    );
-    await Promise.all(workers);
+    await this.runQueue(runnableJobs, rootDirectory);
 
     if (!this.abortController.signal.aborted && this.failedJobs.size > 0) {
       await this.retryFailedPass(rootDirectory);
@@ -118,16 +116,199 @@ export class DownloadEngine {
       'reporter',
       `Summary: ${this.counters.completedFiles} completed, ${this.counters.failedFiles} failed, ${this.reporter.getSummary().skipped} skipped.`,
     );
+    await this.writeManifest(rootDirectory);
+
+    if (!this.abortController.signal.aborted && this.counters.failedFiles === 0) {
+      this.reporter.log('queue', 'Completed job records were retained for archive repair.');
+    }
+  }
+
+  async dryRun(
+    selections: SourceSelection[],
+    rootDirectory: FileSystemDirectoryHandle,
+  ) {
+    this.beginRun('dry_run', selections.length);
+
+    this.reporter.log('scanner', `Preflighting ${selections.length} selected item${selections.length === 1 ? '' : 's'}...`);
+    this.emitProgress('scanning');
+    const jobs = await this.scanSelections(selections, []);
+    this.counters.totalBytes = jobs.reduce((total, job) => total + job.size, 0);
+    this.counters.queuedFiles = jobs.length;
+
+    for (const job of jobs) {
+      const existing = await this.committer.getExistingFileByPath(rootDirectory, job.localPath);
+      const verification = existing
+        ? `Dry run: local file exists; conflict strategy is ${this.settings.conflictStrategy}.`
+        : 'Dry run: file would be downloaded.';
+      this.recordManifestItem(manifestItemFromJob(this.runId, job, 'unverified', { verification }));
+      this.reporter.job({ ...job, status: 'queued', summary: verification });
+    }
+
+    this.emitProgress('completed');
+    this.reporter.log('reporter', `Dry run summary: ${jobs.length} file${jobs.length === 1 ? '' : 's'}, ${this.counters.totalBytes} bytes.`);
+  }
+
+  async startIncremental(rootDirectory: FileSystemDirectoryHandle) {
+    this.beginRun('incremental', 1);
+    this.reporter.log('scanner', 'Checking OneDrive delta changes...');
+    this.emitProgress('scanning');
+
+    try {
+      const tokenKey = 'me';
+      let token: string | undefined;
+      try {
+        token = await this.store.getDeltaToken(tokenKey);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.reporter.log('scanner', `Could not read saved delta token; starting a fresh delta scan: ${message}`);
+      }
+      this.reporter.log('scanner', token ? 'Using saved OneDrive delta token.' : 'No saved delta token found; starting delta baseline scan.');
+      const delta = await this.oneDrive.delta(tokenKey, token);
+      if (!token) {
+        if (delta.deltaToken) await this.store.saveDeltaToken(tokenKey, delta.deltaToken);
+        this.reporter.log('scanner', 'Baseline delta token saved. Incremental archive will download changes from the next run.');
+        this.counters.queuedFiles = 0;
+        this.emitProgress('completed');
+        return;
+      }
+      this.reporter.log('scanner', `OneDrive delta returned ${delta.items.length} changed file${delta.items.length === 1 ? '' : 's'}.`);
+      const jobs: DownloadJob[] = [];
+      for (const metadata of delta.items) {
+        const parentParts = this.parentPartsFromRemotePath(metadata);
+        const job = await this.createOrResumeJob(metadata, parentParts);
+        if (job) jobs.push(job);
+      }
+
+      this.counters.totalBytes = jobs.reduce((total, job) => total + job.size, 0);
+      this.counters.downloadedBytes = jobs.reduce((total, job) => total + job.downloadedBytes, 0);
+      this.counters.queuedFiles = jobs.length;
+      this.counters.lastSpeedBytes = this.counters.downloadedBytes;
+      this.counters.lastSpeedAt = performance.now();
+      this.emitProgress('queued');
+      this.reporter.log('scanner', `Incremental scan found ${jobs.length} changed file${jobs.length === 1 ? '' : 's'} to archive.`);
+
+      await this.runQueue(jobs, rootDirectory);
+
+      if (!this.abortController.signal.aborted && this.failedJobs.size > 0) {
+        await this.retryFailedPass(rootDirectory);
+      }
+
+      this.emitProgress(this.counters.failedFiles > 0 ? 'failed' : 'completed');
+      this.reporter.log('reporter', `Incremental summary: ${this.counters.completedFiles} completed, ${this.counters.failedFiles} failed.`);
+      await this.writeManifest(rootDirectory);
+
+      if (!this.abortController.signal.aborted && this.counters.failedFiles === 0) {
+        if (delta.deltaToken) {
+          try {
+            await this.store.saveDeltaToken(tokenKey, delta.deltaToken);
+            this.reporter.log('scanner', 'Saved OneDrive delta token after successful incremental archive.');
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.reporter.log('scanner', `Incremental archive completed, but the delta token could not be saved: ${message}`);
+          }
+        }
+        this.reporter.log('queue', 'Completed job records were retained for archive repair.');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Incremental stage failed: ${message}`);
+    }
+  }
+
+  async repairFromLatestManifest(rootDirectory: FileSystemDirectoryHandle) {
+    this.beginRun('repair', 1);
+    const latest = await this.store.getLatestManifest();
+    const storedCompletedJobs = await this.store.getJobsByStatus(['completed', 'skipped']);
+    if (!latest && storedCompletedJobs.length === 0) {
+      this.reporter.log('verifier', 'No saved archive manifest or completed job records are available for repair.');
+      this.emitProgress('idle');
+      return;
+    }
+    const manifestJobs = latest?.items
+      .filter(item => ['completed', 'verified', 'skipped'].includes(item.status))
+      .map(item => this.jobFromManifestItem(item)) || [];
+    const candidatesById = new Map<string, DownloadJob>();
+    for (const job of [...manifestJobs, ...storedCompletedJobs]) {
+      candidatesById.set(job.id, job);
+    }
+    const candidates = Array.from(candidatesById.values());
+    this.counters.totalBytes = candidates.reduce((total, item) => total + item.size, 0);
+    this.counters.queuedFiles = candidates.length;
+    this.reporter.log('verifier', `Checking ${candidates.length} saved archive file${candidates.length === 1 ? '' : 's'}...`);
+    this.emitProgress('verifying');
+
+    const repairJobs: DownloadJob[] = [];
+    for (const job of candidates) {
+      const file = await this.committer.getExistingFileByPath(rootDirectory, job.localPath);
+      if (!file) {
+        this.recordManifestItem(manifestItemFromJob(this.runId, job, 'missing_local', { error: 'Local file is missing.' }));
+        repairJobs.push(await this.store.upsertJob({ ...job, status: 'queued', downloadedBytes: 0, chunks: this.createChunks(job.size) }));
+        continue;
+      }
+
+      const verification = await this.verifier.verify(file, job);
+      if (verification.ok) {
+        this.counters.completedFiles += 1;
+        this.recordManifestItem(manifestItemFromJob(this.runId, job, 'verified', { verification: verification.message }));
+        this.reporter.job({ ...job, status: 'completed', downloadedBytes: job.size, summary: verification.message });
+      } else {
+        this.recordManifestItem(manifestItemFromJob(this.runId, job, 'unverified', { error: verification.message }));
+        repairJobs.push(await this.store.upsertJob({ ...job, status: 'queued', downloadedBytes: 0, chunks: this.createChunks(job.size) }));
+      }
+    }
+
+    this.counters.queuedFiles = repairJobs.length;
+    if (repairJobs.length > 0) {
+      this.reporter.log('queue', `Repairing ${repairJobs.length} missing or unverified file${repairJobs.length === 1 ? '' : 's'}...`);
+      await this.runQueue(repairJobs, rootDirectory);
+    }
+
+    this.emitProgress(this.counters.failedFiles > 0 ? 'failed' : 'completed');
+    this.reporter.log('reporter', `Repair summary: ${this.counters.completedFiles} verified/completed, ${this.counters.failedFiles} failed.`);
+    await this.writeManifest(rootDirectory);
+  }
+
+  async repairSelections(
+    selections: SourceSelection[],
+    rootDirectory: FileSystemDirectoryHandle,
+  ) {
+    this.beginRun('repair', selections.length);
+    this.reporter.log('scanner', `Scanning ${selections.length} selected item${selections.length === 1 ? '' : 's'} for repair...`);
+    this.emitProgress('scanning');
+    const jobs = await this.scanSelections(selections, []);
+    const repairJobs: DownloadJob[] = [];
+    for (const job of jobs) {
+      const existing = await this.committer.getExistingFileByPath(rootDirectory, job.localPath);
+      if (!existing) {
+        repairJobs.push({ ...job, status: 'queued', downloadedBytes: 0, chunks: this.createChunks(job.size) });
+        this.recordManifestItem(manifestItemFromJob(this.runId, job, 'missing_local', { error: 'Local file is missing.' }));
+        continue;
+      }
+      const verification = await this.verifier.verify(existing, job);
+      if (verification.ok) {
+        this.counters.completedFiles += 1;
+        this.recordManifestItem(manifestItemFromJob(this.runId, job, 'verified', { verification: verification.message }));
+      } else {
+        repairJobs.push({ ...job, status: 'queued', downloadedBytes: 0, chunks: this.createChunks(job.size) });
+        this.recordManifestItem(manifestItemFromJob(this.runId, job, 'unverified', { error: verification.message }));
+      }
+    }
+
+    this.counters.totalBytes = repairJobs.reduce((total, job) => total + job.size, 0);
+    this.counters.queuedFiles = repairJobs.length;
+    this.emitProgress('queued');
+    this.reporter.log('queue', `Repair selected found ${repairJobs.length} missing or unverified file${repairJobs.length === 1 ? '' : 's'}.`);
+    await this.runQueue(repairJobs, rootDirectory);
+    this.emitProgress(this.counters.failedFiles > 0 ? 'failed' : 'completed');
+    this.reporter.log('reporter', `Repair selected summary: ${this.counters.completedFiles} verified/completed, ${this.counters.failedFiles} failed.`);
+    await this.writeManifest(rootDirectory);
   }
 
   async retryJobs(
     jobIds: string[],
     rootDirectory: FileSystemDirectoryHandle,
   ) {
-    this.abortController = new AbortController();
-    this.paused = false;
-    this.resetCounters();
-    this.failedJobs.clear();
+    this.beginRun('normal', jobIds.length);
 
     const jobs = (await Promise.all(jobIds.map(id => this.store.getJob(id))))
       .filter((job): job is DownloadJob => Boolean(job));
@@ -149,18 +330,18 @@ export class DownloadEngine {
 
     this.reporter.log('queue', `Retrying ${retryableJobs.length} failed file${retryableJobs.length === 1 ? '' : 's'}...`);
     this.emitProgress('retrying');
-    const queue = [...retryableJobs];
-    const workers = Array.from(
-      { length: Math.max(1, this.settings.maxGlobalConcurrentDownloads) },
-      () => this.runWorker(queue, rootDirectory),
-    );
-    await Promise.all(workers);
+    await this.runQueue(retryableJobs, rootDirectory);
 
     this.emitProgress(this.counters.failedFiles > 0 ? 'failed' : 'completed');
     this.reporter.log(
       'reporter',
       `Retry summary: ${this.counters.completedFiles} completed, ${this.counters.failedFiles} failed.`,
     );
+    await this.writeManifest(rootDirectory);
+
+    if (!this.abortController.signal.aborted && this.counters.failedFiles === 0) {
+      this.reporter.log('queue', 'Completed job records were retained for archive repair.');
+    }
   }
 
   private async runWorker(queue: DownloadJob[], rootDirectory: FileSystemDirectoryHandle) {
@@ -172,6 +353,20 @@ export class DownloadEngine {
       if (!job) return;
       await this.runJob(job, rootDirectory);
     }
+  }
+
+  private async runQueue(jobs: DownloadJob[], rootDirectory: FileSystemDirectoryHandle) {
+    const queue = [...(this.settings.smallFilesFirst ? [...jobs].sort((a, b) => a.size - b.size) : jobs)];
+    const baseConcurrency = Math.max(1, this.settings.maxGlobalConcurrentDownloads);
+    const adaptiveConcurrency = Math.max(1, baseConcurrency - Math.min(this.throttleEvents, baseConcurrency - 1));
+    if (adaptiveConcurrency < baseConcurrency) {
+      this.reporter.log('queue', `Reduced concurrency to ${adaptiveConcurrency} after OneDrive throttling.`);
+    }
+    const workers = Array.from(
+      { length: adaptiveConcurrency },
+      () => this.runWorker(queue, rootDirectory),
+    );
+    await Promise.all(workers);
   }
 
   private async retryFailedPass(rootDirectory: FileSystemDirectoryHandle) {
@@ -187,12 +382,7 @@ export class DownloadEngine {
     this.reporter.log('queue', `Retrying ${retryJobs.length} failed file${retryJobs.length === 1 ? '' : 's'} once before finishing...`);
     this.emitProgress('retrying');
 
-    const queue = [...retryJobs];
-    const workers = Array.from(
-      { length: Math.max(1, this.settings.maxGlobalConcurrentDownloads) },
-      () => this.runWorker(queue, rootDirectory),
-    );
-    await Promise.all(workers);
+    await this.runQueue(retryJobs, rootDirectory);
   }
 
   private prepareRetryJob(job: DownloadJob): DownloadJob {
@@ -284,10 +474,11 @@ export class DownloadEngine {
       : this.createChunks(metadata.size);
 
     if (existing && !this.remoteMatches(existing, metadata)) {
-      await this.store.updateJob(existing.id, {
+      const stale = await this.store.updateJob(existing.id, {
         status: 'stale_remote_changed',
         errorMessage: 'Remote file changed since download started; restarting safely.',
       });
+      if (stale) this.recordManifestItem(manifestItemFromJob(this.runId, stale, 'remote_changed', { error: stale.errorMessage }));
       this.reporter.increment('changedRemotely');
       this.reporter.log('scanner', `Remote file changed since download started; restarting safely: ${metadata.name}`);
     }
@@ -383,14 +574,14 @@ export class DownloadEngine {
 
       const commit = await this.committer.commit(directory, finalVerificationFile, current, this.settings.conflictStrategy);
       if (!commit.committed) {
-        await this.completeJob(current, 'skipped', current.size, commit.reason, false);
+        await this.completeJob(current, 'skipped', current.size, commit.reason, false, commit.finalName);
         this.reporter.increment('conflicts');
         this.reporter.log('committer', commit.reason || `Skipped existing file: ${current.name}`, current);
         return;
       }
 
       await this.committer.clearPartial(directory, current.name);
-      await this.completeJob(current, 'completed', current.size, finalVerification.message, false);
+      await this.completeJob(current, 'completed', current.size, finalVerification.message, false, commit.finalName);
       this.reporter.increment('downloaded');
       this.reporter.increment('verified');
       if (this.settings.preserveTimestamps && current.lastModifiedDateTime) {
@@ -414,6 +605,7 @@ export class DownloadEngine {
       }
       if (failed) this.reporter.job(failed);
       if (failed && !wasCancelled) this.failedJobs.set(failed.id, failed);
+      this.recordManifestItem(manifestItemFromJob(this.runId, failed || job, wasCancelled ? 'cancelled' : 'failed', { error: message }));
       this.reporter.log('downloader', `Failed ${job.name}: ${message}`, failed || job);
       this.emitProgress('failed', failed || job);
     }
@@ -484,6 +676,7 @@ export class DownloadEngine {
           const retryAfter = error instanceof HttpDownloadError ? error.retryAfterSeconds : undefined;
           const delay = backoffDelayMs(attempt, retryAfter);
           if (retryAfter !== undefined) {
+            this.throttleEvents += 1;
             const throttled = await this.store.updateJob(job.id, { status: 'throttled' });
             this.reporter.log('downloader', `OneDrive throttled requests; retrying after ${Math.ceil(retryAfter)} seconds.`, throttled || job);
             this.emitProgress('throttled', throttled || job, Date.now() + delay);
@@ -577,6 +770,7 @@ export class DownloadEngine {
     downloadedBytes: number,
     summary?: string,
     countBytes = false,
+    finalName?: string,
   ) {
     const saved = await this.store.updateJob(job.id, {
       status,
@@ -587,6 +781,7 @@ export class DownloadEngine {
     });
     this.counters.completedFiles += 1;
     if (saved) this.reporter.job(saved);
+    this.recordManifestItem(manifestItemFromJob(this.runId, saved || job, status, { verification: summary, finalName }));
     if (countBytes) {
       this.addDownloadedBytes(Math.max(0, job.size - job.downloadedBytes), saved || job);
     }
@@ -670,6 +865,82 @@ export class DownloadEngine {
       && job.size === metadata.size
       && (!job.eTag || !metadata.eTag || job.eTag === metadata.eTag)
       && (!job.cTag || !metadata.cTag || job.cTag === metadata.cTag);
+  }
+
+  private beginRun(mode: DownloadRunMode, scanPending: number) {
+    this.abortController = new AbortController();
+    this.paused = false;
+    this.mode = mode;
+    this.runId = createRunId();
+    this.startedAt = new Date().toISOString();
+    this.manifestItems.clear();
+    this.resetCounters();
+    this.failedJobs.clear();
+    this.scanProcessed = 0;
+    this.scanPending = scanPending;
+    this.throttleEvents = 0;
+  }
+
+  private recordManifestItem(item: RunManifestItem) {
+    this.manifestItems.set(`${item.driveId}:${item.itemId}:${item.localPath}`, item);
+  }
+
+  private async writeManifest(rootDirectory: FileSystemDirectoryHandle) {
+    if (this.mode === 'dry_run') return;
+    const items = Array.from(this.manifestItems.values());
+    const manifest = createManifest(
+      this.runId,
+      this.mode,
+      rootDirectory.name,
+      this.startedAt,
+      this.settings,
+      this.reporter.getSummary(),
+      items,
+      this.counters.totalBytes,
+      this.counters.completedFiles,
+      this.counters.failedFiles,
+    );
+    try {
+      await this.store.saveManifest(manifest);
+      this.reporter.log('reporter', `Saved archive manifest in browser storage with ${items.length} item${items.length === 1 ? '' : 's'}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.reporter.log('reporter', `Archive completed, but the manifest could not be saved: ${message}`);
+    }
+  }
+
+  private parentPartsFromRemotePath(metadata: RemoteItemMetadata) {
+    const withoutGraphPrefix = metadata.remotePath.replace(/^.*?:\//, '');
+    const parts = withoutGraphPrefix.split('/').filter(Boolean);
+    if (parts.at(-1) === metadata.name) parts.pop();
+    return parts;
+  }
+
+  private jobFromManifestItem(item: RunManifestItem): DownloadJob {
+    return {
+      id: `${item.driveId}:${item.itemId}:${item.localPath}`,
+      driveId: item.driveId,
+      itemId: item.itemId,
+      name: item.name,
+      remotePath: item.remotePath,
+      localPath: item.localPath,
+      partialPath: `${item.localPath}.partial`,
+      size: item.size,
+      eTag: item.eTag,
+      cTag: item.cTag,
+      lastModifiedDateTime: item.lastModifiedDateTime,
+      hashes: {
+        sha1Hash: item.sha1Hash,
+        quickXorHash: item.quickXorHash,
+      },
+      status: 'queued',
+      priority: 0,
+      retryCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      downloadedBytes: 0,
+      chunks: this.createChunks(item.size),
+    };
   }
 
   private resetCounters() {

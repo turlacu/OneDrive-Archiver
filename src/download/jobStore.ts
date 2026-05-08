@@ -1,4 +1,4 @@
-import type { DownloadJob, DownloadJobStatus } from './types';
+import type { DownloadJob, DownloadJobStatus, RunManifest } from './types';
 
 interface StoredDeltaToken {
   driveId: string;
@@ -7,7 +7,7 @@ interface StoredDeltaToken {
 }
 
 const databaseName = 'syncpoint-downloads';
-const databaseVersion = 2;
+const databaseVersion = 3;
 const staleJobAgeMs = 14 * 24 * 60 * 60 * 1000;
 
 export class DownloadJobStore {
@@ -18,7 +18,14 @@ export class DownloadJobStore {
       this.dbPromise = new Promise((resolve, reject) => {
         const request = indexedDB.open(databaseName, databaseVersion);
         request.onerror = () => reject(request.error);
-        request.onsuccess = () => resolve(request.result);
+        request.onsuccess = () => {
+          const db = request.result;
+          db.onversionchange = () => {
+            db.close();
+            this.dbPromise = undefined;
+          };
+          resolve(db);
+        };
         request.onupgradeneeded = () => {
           const db = request.result;
           if (!db.objectStoreNames.contains('jobs')) {
@@ -34,6 +41,10 @@ export class DownloadJobStore {
           if (!db.objectStoreNames.contains('settings')) {
             db.createObjectStore('settings', { keyPath: 'key' });
           }
+          if (!db.objectStoreNames.contains('manifests')) {
+            const manifests = db.createObjectStore('manifests', { keyPath: 'runId' });
+            manifests.createIndex('finishedAt', 'finishedAt', { unique: false });
+          }
           const settings = request.transaction?.objectStore('settings');
           settings?.put({ key: 'schemaVersion', value: databaseVersion, updatedAt: new Date().toISOString() });
         };
@@ -41,6 +52,18 @@ export class DownloadJobStore {
     }
 
     return this.dbPromise;
+  }
+
+  private async reopen() {
+    const db = await this.dbPromise?.catch(() => undefined);
+    db?.close();
+    this.dbPromise = undefined;
+    return this.open();
+  }
+
+  private isInvalidObjectHandle(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.includes('ObjectHandle is Invalid') || message.includes('invalid object handle');
   }
 
   private requestToPromise<T>(request: IDBRequest<T>) {
@@ -62,12 +85,22 @@ export class DownloadJobStore {
     storeName: string,
     mode: IDBTransactionMode,
     run: (store: IDBObjectStore) => Promise<T>,
+    retry = true,
   ) {
-    const db = await this.open();
-    const transaction = db.transaction(storeName, mode);
-    const result = await run(transaction.objectStore(storeName));
-    await this.transactionDone(transaction);
-    return result;
+    try {
+      const db = await this.open();
+      const transaction = db.transaction(storeName, mode);
+      const done = this.transactionDone(transaction);
+      const result = await run(transaction.objectStore(storeName));
+      await done;
+      return result;
+    } catch (error) {
+      if (retry && this.isInvalidObjectHandle(error)) {
+        await this.reopen();
+        return this.withStore(storeName, mode, run, false);
+      }
+      throw error;
+    }
   }
 
   async upsertJob(job: DownloadJob) {
@@ -108,8 +141,46 @@ export class DownloadJobStore {
     return record?.token;
   }
 
+  async saveManifest(manifest: RunManifest) {
+    await this.withStore('manifests', 'readwrite', store => this.requestToPromise(store.put(manifest)));
+    await this.withStore('settings', 'readwrite', store => this.requestToPromise(store.put({
+      key: 'latestManifestRunId',
+      value: manifest.runId,
+      updatedAt: new Date().toISOString(),
+    })));
+  }
+
+  async getLatestManifest() {
+    const pointer = await this.withStore<{ key: string; value: string } | undefined>(
+      'settings',
+      'readonly',
+      store => this.requestToPromise(store.get('latestManifestRunId')),
+    );
+    if (pointer?.value) {
+      const manifest = await this.withStore<RunManifest | undefined>(
+        'manifests',
+        'readonly',
+        store => this.requestToPromise(store.get(pointer.value)),
+      );
+      if (manifest) return manifest;
+    }
+
+    const manifests = await this.withStore<RunManifest[]>('manifests', 'readonly', store => this.requestToPromise(store.getAll()));
+    return manifests.sort((a, b) => Date.parse(b.finishedAt) - Date.parse(a.finishedAt))[0];
+  }
+
   async resetJobs() {
     await this.withStore('jobs', 'readwrite', store => this.requestToPromise(store.clear()));
+  }
+
+  async deleteCompletedJobs() {
+    const completed = await this.getJobsByStatus(['completed']);
+    if (completed.length === 0) return 0;
+
+    await this.withStore('jobs', 'readwrite', async store => {
+      await Promise.all(completed.map(job => this.requestToPromise(store.delete(job.id))));
+    });
+    return completed.length;
   }
 
   async cleanupStaleJobs(maxAgeMs = staleJobAgeMs) {
