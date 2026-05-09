@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">OneDrive Archiver</title>
+  <desc id="desc">A cloud archive icon for OneDrive Archiver.</desc>
+  <defs>
+    <linearGradient id="sky" x1="92" y1="70" x2="420" y2="432" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="0.52" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="box" x1="164" y1="276" x2="348" y2="438" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#cbd5e1"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="#0f172a"/>
+  <circle cx="256" cy="256" r="214" fill="url(#sky)"/>
+  <path fill="#eff6ff" d="M174 269h198c47 0 84-35 84-80 0-43-35-78-79-80-17-40-58-67-104-67-58 0-105 41-113 96-53 4-94 45-94 94 0 21 8 39 22 54 21-11 48-17 86-17Z"/>
+  <path fill="#bfdbfe" d="M372 269c47 0 84-35 84-80 0-43-35-78-79-80-17-40-58-67-104-67-10 0-20 1-29 4 56 12 98 60 98 118 0 40-20 76-50 98l80 7Z" opacity=".7"/>
+  <path fill="#0f172a" d="M139 258h234c16 0 29 13 29 29v94c0 16-13 29-29 29H139c-16 0-29-13-29-29v-94c0-16 13-29 29-29Z" opacity=".22"/>
+  <path fill="url(#box)" d="M139 243h234c16 0 29 13 29 29v94c0 16-13 29-29 29H139c-16 0-29-13-29-29v-94c0-16 13-29 29-29Z"/>
+  <path fill="#475569" d="M110 286h292v42H110z"/>
+  <path fill="#f8fafc" d="M208 285h96c7 0 12 5 12 12s-5 12-12 12h-96c-7 0-12-5-12-12s5-12 12-12Z"/>
+  <path fill="#0f766e" d="M253 354a15 15 0 0 1 22 0l18 19 44-53a15 15 0 1 1 23 19l-55 66a15 15 0 0 1-22 1l-30-31a15 15 0 0 1 0-21Z"/>
+</svg>
