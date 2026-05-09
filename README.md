@@ -140,30 +140,59 @@ Recommended archive path inside the container:
 
 ### Install with the bundled Unraid template
 
+Use this option for the easiest install. The template creates all required container settings for the user: port, archive path, OAuth variables, permissions, and timezone.
+
+If you only type `ghcr.io/turlacu/onedrive-archiver:latest` into Unraid's `Repository` field, Unraid creates a plain Docker container form and will not know which settings to show. Import the XML template first if you want the settings to appear automatically in the container editor.
+
 The repository includes a Docker template at:
 
 ```txt
 unraid/onedrive-archiver.xml
 ```
 
-To install it manually:
+To install it from the Unraid terminal:
 
-1. Copy the XML template to your Unraid flash drive:
-
-```txt
-/boot/config/plugins/dockerMan/templates-user/my-onedrive-archiver.xml
+```bash
+mkdir -p /boot/config/plugins/dockerMan/templates-user
+curl -L -o /boot/config/plugins/dockerMan/templates-user/my-onedrive-archiver.xml \
+  https://raw.githubusercontent.com/turlacu/OneDrive-Archiver/main/unraid/onedrive-archiver.xml
 ```
 
-2. In the Unraid WebGUI, open the Docker tab.
-3. Click `Add Container`.
-4. Select the `OneDrive-Archiver` template.
-5. Fill in `APP_URL`, `SESSION_SECRET`, `MICROSOFT_CLIENT_ID`, and `MICROSOFT_CLIENT_SECRET`.
-6. Adjust the host archive path if needed.
-7. Click `Apply`.
+Then create the container:
+
+1. In the Unraid WebGUI, open the Docker tab.
+2. Click `Add Container`.
+3. Select `OneDrive-Archiver` from the template dropdown.
+4. Fill in `APP_URL`, `SESSION_SECRET`, `MICROSOFT_CLIENT_ID`, and `MICROSOFT_CLIENT_SECRET`.
+5. Adjust the host archive path if needed.
+6. Click `Apply`.
+
+The template provides these visible settings:
+
+```txt
+Web Interface Port
+Archive Download Path
+APP_URL
+SESSION_SECRET
+MICROSOFT_CLIENT_ID
+MICROSOFT_CLIENT_SECRET
+SERVER_DOWNLOAD_ROOT
+```
+
+Advanced settings are also included:
+
+```txt
+NODE_ENV
+PORT
+PUID
+PGID
+UMASK
+TZ
+```
 
 ### Install with Add Container
 
-If you do not use the XML template, create a container manually from the Docker tab.
+If you do not use the XML template, create a container manually from the Docker tab and add the settings below yourself.
 
 Main fields:
 
