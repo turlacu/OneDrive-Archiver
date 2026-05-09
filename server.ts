@@ -35,8 +35,16 @@ const SERVER_DOWNLOAD_ROOT = process.env.SERVER_DOWNLOAD_ROOT;
 const serverDownloads = new ServerDownloadManager(SERVER_DOWNLOAD_ROOT);
 let msalClient: msal.ConfidentialClientApplication | null = null;
 
-if (!isDevelopment && (!process.env.SESSION_SECRET || SESSION_SECRET === FALLBACK_SESSION_SECRET)) {
-    throw new Error('SESSION_SECRET must be configured to a strong unique value outside development.');
+if (!isDevelopment) {
+    const missing = [
+        !process.env.APP_URL ? 'APP_URL' : '',
+        (!process.env.SESSION_SECRET || SESSION_SECRET === FALLBACK_SESSION_SECRET) ? 'SESSION_SECRET' : '',
+        !CLIENT_ID ? 'MICROSOFT_CLIENT_ID' : '',
+        !CLIENT_SECRET ? 'MICROSOFT_CLIENT_SECRET' : '',
+    ].filter(Boolean);
+    if (missing.length > 0) {
+        throw new Error(`Missing required production environment variable${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}`);
+    }
 }
 
 function isUsableAccessToken(value: unknown) {
@@ -108,7 +116,7 @@ async function refreshSessionToken(req: express.Request) {
 
 async function startServer() {
     const app = express();
-    const PORT = 3000;
+    const PORT = Number(process.env.PORT || 3000);
 
     app.use(express.json({ limit: '1mb' }));
     app.use(cookieParser());
@@ -124,6 +132,10 @@ async function startServer() {
             maxAge: 24 * 60 * 60 * 1000 // 24 hours
         }
     }));
+
+    app.get('/api/health', (_req, res) => {
+        res.json({ ok: true });
+    });
 
     // Logging middleware. Do not log callback query strings because they contain OAuth codes.
     app.use((req, res, next) => {

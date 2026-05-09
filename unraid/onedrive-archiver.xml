@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Container version="2">
+  <Name>OneDrive-Archiver</Name>
+  <Repository>ghcr.io/turlacu/onedrive-archiver:latest</Repository>
+  <Registry>https://github.com/turlacu/OneDrive-Archiver/pkgs/container/onedrive-archiver</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/turlacu/OneDrive-Archiver/issues</Support>
+  <Project>https://github.com/turlacu/OneDrive-Archiver</Project>
+  <Overview>OneDrive Archiver signs in to Microsoft OneDrive, lets you browse your drive, and archives selected files or folders to an Unraid share.</Overview>
+  <Category>Backup: Cloud:</Category>
+  <WebUI>http://[IP]:[PORT:3000]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/turlacu/OneDrive-Archiver/main/unraid/onedrive-archiver.xml</TemplateURL>
+  <Icon/>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="WebUI" Target="3000" Default="3000" Mode="tcp" Description="Container port for the OneDrive Archiver web interface. Change the host port if 3000 is already in use." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
+  <Config Name="Archive Download Path" Target="/downloads/onedrive-archive" Default="/mnt/user/Backups/OneDrive" Mode="rw" Description="Unraid path where server-side OneDrive archive files will be written." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Backups/OneDrive</Config>
+  <Config Name="NODE_ENV" Target="NODE_ENV" Default="production" Description="Run the app in production mode." Type="Variable" Display="advanced-hide" Required="true" Mask="false">production</Config>
+  <Config Name="APP_URL" Target="APP_URL" Default="https://onedrivearchiver.example.com" Description="Public URL used for OAuth callbacks. Use HTTPS for non-localhost installs and add APP_URL/api/callback in Azure." Type="Variable" Display="always" Required="true" Mask="false">https://onedrivearchiver.example.com</Config>
+  <Config Name="SESSION_SECRET" Target="SESSION_SECRET" Default="" Description="Long random string used to sign the local auth session cookie." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="MICROSOFT_CLIENT_ID" Target="MICROSOFT_CLIENT_ID" Default="" Description="Azure app registration client/application ID." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="MICROSOFT_CLIENT_SECRET" Target="MICROSOFT_CLIENT_SECRET" Default="" Description="Azure app registration client secret value, not the secret ID." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="SERVER_DOWNLOAD_ROOT" Target="SERVER_DOWNLOAD_ROOT" Default="/downloads/onedrive-archive" Description="Container path that server-side downloads are constrained to. This should match the container path above." Type="Variable" Display="always" Required="true" Mask="false">/downloads/onedrive-archive</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Description="User ID used to write files. Unraid default is 99." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Description="Group ID used to write files. Unraid users group default is 100." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="UMASK" Target="UMASK" Default="022" Description="File creation permissions mask." Type="Variable" Display="advanced" Required="true" Mask="false">022</Config>
+  <Config Name="TZ" Target="TZ" Default="Etc/UTC" Description="Container timezone, for example America/New_York or Europe/Bucharest." Type="Variable" Display="advanced" Required="false" Mask="false">Etc/UTC</Config>
+</Container>

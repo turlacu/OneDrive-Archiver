@@ -113,13 +113,78 @@ The app will only write inside `SERVER_DOWNLOAD_ROOT`.
 
 Use server-target mode when you want downloads to land on the UNRAID server rather than the browser PC.
 
-Recommended container path:
+### Requirements
+
+- Unraid Docker service enabled.
+- A Microsoft Azure app registration with a Web redirect URI.
+- A public HTTPS URL for the app, usually through a reverse proxy. Microsoft only allows `http://` redirect URIs for localhost development.
+- A long random `SESSION_SECRET`.
+
+Recommended image:
+
+```txt
+ghcr.io/turlacu/onedrive-archiver:latest
+```
+
+Container port:
+
+```txt
+3000
+```
+
+Recommended archive path inside the container:
 
 ```txt
 /downloads/onedrive-archive
 ```
 
-Example UNRAID volume mapping:
+### Install with the bundled Unraid template
+
+The repository includes a Docker template at:
+
+```txt
+unraid/onedrive-archiver.xml
+```
+
+To install it manually:
+
+1. Copy the XML template to your Unraid flash drive:
+
+```txt
+/boot/config/plugins/dockerMan/templates-user/my-onedrive-archiver.xml
+```
+
+2. In the Unraid WebGUI, open the Docker tab.
+3. Click `Add Container`.
+4. Select the `OneDrive-Archiver` template.
+5. Fill in `APP_URL`, `SESSION_SECRET`, `MICROSOFT_CLIENT_ID`, and `MICROSOFT_CLIENT_SECRET`.
+6. Adjust the host archive path if needed.
+7. Click `Apply`.
+
+### Install with Add Container
+
+If you do not use the XML template, create a container manually from the Docker tab.
+
+Main fields:
+
+```txt
+Name:       OneDrive-Archiver
+Repository: ghcr.io/turlacu/onedrive-archiver:latest
+Network:    bridge
+WebUI:      http://[IP]:[PORT:3000]/
+```
+
+Port mapping:
+
+```txt
+Container port: 3000
+Host port:      3000
+Protocol:       TCP
+```
+
+You can change the host port if `3000` is already in use. Leave the container port as `3000` unless you also set the `PORT` environment variable.
+
+Volume mapping:
 
 ```txt
 Host path:      /mnt/user/Backups/OneDrive
@@ -136,6 +201,10 @@ SESSION_SECRET=replace-with-a-long-random-string
 MICROSOFT_CLIENT_ID=your-app-client-id
 MICROSOFT_CLIENT_SECRET=your-client-secret-value
 SERVER_DOWNLOAD_ROOT=/downloads/onedrive-archive
+PUID=99
+PGID=100
+UMASK=022
+TZ=Etc/UTC
 ```
 
 Azure redirect URI:
@@ -143,6 +212,40 @@ Azure redirect URI:
 ```txt
 https://your-unraid-app-domain.example.com/api/callback
 ```
+
+`APP_URL` must exactly match the external URL used in your browser, without a trailing slash. The Azure redirect URI must be that URL plus `/api/callback`.
+
+### File permissions
+
+The container supports Unraid-style file ownership variables:
+
+```env
+PUID=99
+PGID=100
+UMASK=022
+```
+
+The defaults match the standard Unraid `nobody:users` ownership. Change them only if your share requires different permissions.
+
+### Reverse proxy notes
+
+For normal LAN installs, expose the app through an HTTPS reverse proxy and set `APP_URL` to the external HTTPS address. The app trusts one proxy hop and sets secure cookies when `APP_URL` starts with `https://`.
+
+Direct `http://tower:3000` access is useful for checking whether the container starts, but Microsoft OAuth callbacks for non-localhost HTTP URLs are not valid production redirect URIs.
+
+### Updating
+
+When a new image is published, use the Docker tab to check for updates or force update the container. Your archived files stay on the mapped Unraid share.
+
+### Build locally
+
+If the published image is not available yet, build it from the repository root:
+
+```bash
+docker build -t onedrive-archiver:local .
+```
+
+Then use `onedrive-archiver:local` as the repository/image value in the Unraid container form.
 
 Usage:
 

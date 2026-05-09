@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+.git
+.github
+.agents
+.codex
+.env
+.env.*
+!.env.example
+*.log
+Dockerfile
+README.md
