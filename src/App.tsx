@@ -1457,7 +1457,7 @@ export default function App() {
                   max={8}
                   value={downloadSettings.maxGlobalConcurrentDownloads}
                   onChange={event => updateDownloadSetting('maxGlobalConcurrentDownloads', Number(event.target.value))}
-                  disabled={isSyncing}
+                  disabled={isSyncing || isServerBusy}
                   className="mt-1 w-full border border-slate-200 dark:border-neutral-700 rounded px-2 py-1 text-xs font-normal bg-white dark:bg-neutral-950 text-slate-700 dark:text-neutral-100 disabled:bg-slate-50 dark:disabled:bg-neutral-900 disabled:text-slate-400 dark:disabled:text-neutral-500"
                 />
               </label>
@@ -1469,7 +1469,8 @@ export default function App() {
                   max={6}
                   value={downloadSettings.maxChunksPerFile}
                   onChange={event => updateDownloadSetting('maxChunksPerFile', Number(event.target.value))}
-                  disabled={isSyncing}
+                  disabled={isSyncing || isServerBusy || targetMode === 'server'}
+                  title={targetMode === 'server' ? 'Chunk settings apply only to browser-target downloads.' : undefined}
                   className="mt-1 w-full border border-slate-200 dark:border-neutral-700 rounded px-2 py-1 text-xs font-normal bg-white dark:bg-neutral-950 text-slate-700 dark:text-neutral-100 disabled:bg-slate-50 dark:disabled:bg-neutral-900 disabled:text-slate-400 dark:disabled:text-neutral-500"
                 />
               </label>
@@ -1481,7 +1482,8 @@ export default function App() {
                   max={128}
                   value={Math.round(downloadSettings.chunkSize / (1024 * 1024))}
                   onChange={event => updateDownloadSetting('chunkSize', Number(event.target.value) * 1024 * 1024)}
-                  disabled={isSyncing}
+                  disabled={isSyncing || isServerBusy || targetMode === 'server'}
+                  title={targetMode === 'server' ? 'Chunk settings apply only to browser-target downloads.' : undefined}
                   className="mt-1 w-full border border-slate-200 dark:border-neutral-700 rounded px-2 py-1 text-xs font-normal bg-white dark:bg-neutral-950 text-slate-700 dark:text-neutral-100 disabled:bg-slate-50 dark:disabled:bg-neutral-900 disabled:text-slate-400 dark:disabled:text-neutral-500"
                 />
               </label>
@@ -1493,7 +1495,7 @@ export default function App() {
                   max={10}
                   value={downloadSettings.retryCount}
                   onChange={event => updateDownloadSetting('retryCount', Number(event.target.value))}
-                  disabled={isSyncing}
+                  disabled={isSyncing || isServerBusy}
                   className="mt-1 w-full border border-slate-200 dark:border-neutral-700 rounded px-2 py-1 text-xs font-normal bg-white dark:bg-neutral-950 text-slate-700 dark:text-neutral-100 disabled:bg-slate-50 dark:disabled:bg-neutral-900 disabled:text-slate-400 dark:disabled:text-neutral-500"
                 />
               </label>
@@ -1503,7 +1505,7 @@ export default function App() {
               <select
                 value={downloadSettings.conflictStrategy}
                 onChange={event => updateDownloadSetting('conflictStrategy', event.target.value as DownloadSettings['conflictStrategy'])}
-                disabled={isSyncing}
+                disabled={isSyncing || isServerBusy}
                 className="mt-1 w-full border border-slate-200 dark:border-neutral-700 rounded px-2 py-1 text-xs font-normal bg-white dark:bg-neutral-950 text-slate-700 dark:text-neutral-100 disabled:bg-slate-50 dark:disabled:bg-neutral-900 disabled:text-slate-400 dark:disabled:text-neutral-500"
               >
                 <option value="skip_existing">Skip existing</option>
@@ -1518,7 +1520,7 @@ export default function App() {
                   type="checkbox"
                   checked={downloadSettings.verifyAfterDownload}
                   onChange={event => updateDownloadSetting('verifyAfterDownload', event.target.checked)}
-                  disabled={isSyncing}
+                  disabled={isSyncing || isServerBusy}
                 />
                 Verify after download
               </label>
