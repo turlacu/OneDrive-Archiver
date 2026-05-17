@@ -63,6 +63,10 @@ interface GraphDriveItem {
   '@microsoft.graph.downloadUrl'?: string;
 }
 
+function oneDriveRelativePath(path: string) {
+  return path.replace(/^.*?:\/?/, '').replace(/^\/+/, '');
+}
+
 interface ActiveFile {
   id: string;
   name: string;
@@ -224,7 +228,7 @@ export default function App() {
     id: item.id,
     name: item.name,
     size: item.size || 0,
-    path: `${item.parentReference?.path || ''}/${item.name}`,
+    path: oneDriveRelativePath(`${item.parentReference?.path || ''}/${item.name}`),
     type: item.folder ? 'folder' : 'file',
     status: 'pending',
     progress: 0,
@@ -840,6 +844,7 @@ export default function App() {
       id: item.id,
       name: item.name,
       type: item.type,
+      sourcePath: item.path,
     }));
   };
 

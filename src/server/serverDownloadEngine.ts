@@ -11,6 +11,7 @@ export interface ServerSourceSelection {
   id: string;
   name: string;
   type: 'file' | 'folder';
+  sourcePath?: string;
 }
 
 interface ServerGraphDriveItem {
@@ -70,6 +71,13 @@ export function resolveInsideRoot(root: string, relativePath: string) {
 
 export function sanitizeUserFolder(email: string) {
   return email.toLowerCase().replace(/[^a-z0-9._-]+/g, '_').replace(/^[._-]+|[._-]+$/g, '') || 'user';
+}
+
+export function relativePathPartsFromGraphPath(remotePath: string, itemName?: string) {
+  const withoutGraphPrefix = remotePath.replace(/^.*?:\/?/, '');
+  const parts = withoutGraphPrefix.split('/').filter(Boolean);
+  if (itemName && parts.at(-1) === itemName) parts.pop();
+  return parts;
 }
 
 class ServerOneDriveClient {
@@ -342,10 +350,8 @@ export class ServerDownloadManager {
     }
     this.log(job, `OneDrive delta returned ${delta.items.length} changed file${delta.items.length === 1 ? '' : 's'}.`);
     return delta.items.map(item => {
-      const remotePath = item.remotePath.includes('/root:')
-        ? item.remotePath.split('/root:').pop() || item.name
-        : item.remotePath;
-      return { ...item, remotePath: normalizeRelativePath([remotePath]) };
+      const parts = relativePathPartsFromGraphPath(item.remotePath);
+      return { ...item, remotePath: normalizeRelativePath(parts.length > 0 ? parts : [item.name]) };
     });
   }
 
@@ -359,7 +365,9 @@ export class ServerDownloadManager {
     const items: RemoteItemMetadata[] = [];
     for (const selection of selections) {
       if (selection.type === 'folder') {
-        const folderParts = [...parentParts, selection.name];
+        const folderParts = selection.sourcePath
+          ? relativePathPartsFromGraphPath(selection.sourcePath)
+          : [...parentParts, selection.name];
         const children = await oneDrive.listChildren(selection.id);
         for (const child of children) {
           if (child.folder || child.package) {
@@ -369,7 +377,10 @@ export class ServerDownloadManager {
           }
         }
       } else {
-        this.addIfIncluded(items, await oneDrive.getItem(selection.id), parentParts, settings);
+        const fileParentParts = selection.sourcePath
+          ? relativePathPartsFromGraphPath(selection.sourcePath, selection.name)
+          : parentParts;
+        this.addIfIncluded(items, await oneDrive.getItem(selection.id), fileParentParts, settings);
       }
       job.snapshot.stagePercent = Math.min(job.snapshot.stagePercent + 1, 99);
       job.updatedAt = new Date().toISOString();
