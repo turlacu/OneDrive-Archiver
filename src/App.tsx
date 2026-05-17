@@ -1081,8 +1081,8 @@ export default function App() {
             ) : serverArchiveEnabled ? (
               <div className={`p-4 border rounded-lg ${serverTargetRoot ? 'border-slate-300 bg-slate-50 dark:bg-neutral-800/60 dark:border-neutral-700' : 'border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30'}`}>
                 <div className="flex items-center gap-2 mb-1">
-                  <HardDrive size={16} className={serverTargetRoot ? 'text-blue-600 dark:text-blue-400' : 'text-red-500'} />
-                  <span className="text-xs font-bold truncate">{serverTargetRoot || 'SERVER_DOWNLOAD_ROOT missing'}</span>
+                  <HardDrive size={16} className={`shrink-0 ${serverTargetRoot ? 'text-blue-600 dark:text-blue-400' : 'text-red-500'}`} />
+                  <span className="min-w-0 text-xs font-bold break-words leading-snug">{serverTargetRoot || 'SERVER_DOWNLOAD_ROOT missing'}</span>
                 </div>
                 <p className="text-[10px] text-slate-500 dark:text-neutral-400 leading-tight">
                   {serverTargetRoot ? 'Server target configured' : 'Set SERVER_DOWNLOAD_ROOT in the server environment'}
@@ -1291,6 +1291,7 @@ export default function App() {
               <ActivityLog
                 logs={logs}
                 failedFiles={failedFiles}
+                activeServerJob={targetMode === 'server' && activeServerJob ? activeServerJob : undefined}
                 isSyncing={isSyncing}
                 canRetry={Boolean(localDir)}
                 onRetryFile={id => retryFailedDownloads([id])}
@@ -1314,20 +1315,6 @@ export default function App() {
                   <div className="text-xl font-bold text-red-600 dark:text-red-400">{targetMode === 'server' && activeServerJob ? activeServerJob.snapshot.failedFiles : syncStats.errors}</div>
                 </div>
               </div>
-              {targetMode === 'server' && activeServerJob && (
-                <div className="border border-slate-200 dark:border-neutral-700 bg-slate-50 dark:bg-neutral-800 rounded p-3 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-[9px] font-bold uppercase text-slate-500 dark:text-neutral-400">Server job</p>
-                    <span className="text-[9px] font-bold uppercase text-blue-600 dark:text-blue-400">{activeServerJob.status}</span>
-                  </div>
-                  <div className="text-[10px] text-slate-500 dark:text-neutral-400 truncate" title={activeServerJob.targetRoot}>{activeServerJob.targetRoot}</div>
-                  <div className="max-h-24 overflow-y-auto space-y-1 font-mono text-[10px] text-slate-600 dark:text-neutral-300">
-                    {activeServerJob.log.slice(0, 5).map((line, index) => (
-                      <div key={`${activeServerJob.id}-${index}`} className="truncate" title={line}>{line}</div>
-                    ))}
-                  </div>
-                </div>
-              )}
               {failedFiles.length > 0 && (
                 <div className="border border-red-100 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 rounded p-3 space-y-2">
                   <p className="text-[9px] font-bold uppercase text-red-700 dark:text-red-300">Failed file details</p>
