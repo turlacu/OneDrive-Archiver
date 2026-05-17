@@ -26,4 +26,9 @@ if [ -n "${SERVER_DOWNLOAD_ROOT:-}" ]; then
   chown "$PUID:$PGID" "$SERVER_DOWNLOAD_ROOT"
 fi
 
+if [ -n "${APP_DATA_DIR:-}" ]; then
+  mkdir -p "$APP_DATA_DIR"
+  chown "$PUID:$PGID" "$APP_DATA_DIR"
+fi
+
 exec su-exec "$PUID:$PGID" "$@"

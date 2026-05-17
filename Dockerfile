@@ -17,7 +17,7 @@ RUN apk add --no-cache su-exec
 
 ENV NODE_ENV=production \
     PORT=3000 \
-    SERVER_DOWNLOAD_ROOT=/downloads/onedrive-archive \
+    APP_DATA_DIR=/config \
     PUID=99 \
     PGID=100 \
     UMASK=022

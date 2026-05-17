@@ -5,6 +5,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { normalizeRelativePath, shouldIncludeFile } from '../download/pathTools';
 import { defaultDownloadSettings, type DownloadSettings, type DownloadProgressSnapshot, type DownloadSummary, type RemoteHashes, type RemoteItemMetadata } from '../download/types';
+import { ServerStateStore, type PersistedServerJob, type ServerUser } from './serverStateStore';
 
 export interface ServerSourceSelection {
   id: string;
@@ -22,6 +23,7 @@ interface ServerGraphDriveItem {
   folder?: unknown;
   file?: { hashes?: RemoteHashes };
   package?: unknown;
+  deleted?: unknown;
   parentReference?: {
     driveId?: string;
     path?: string;
@@ -31,14 +33,18 @@ interface ServerGraphDriveItem {
 
 interface ServerDownloadJob {
   id: string;
-  mode: 'start' | 'dry-run' | 'repair';
-  status: 'queued' | 'scanning' | 'downloading' | 'completed' | 'failed' | 'cancelled';
+  userEmail: string;
+  mode: 'start' | 'dry-run' | 'repair' | 'incremental';
+  status: 'queued' | 'scanning' | 'downloading' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   createdAt: string;
   updatedAt: string;
   targetRoot: string;
+  selections: ServerSourceSelection[];
+  settings: Record<string, unknown>;
   log: string[];
   snapshot: DownloadProgressSnapshot;
   abortController: AbortController;
+  nextDeltaToken?: string;
 }
 
 const emptySummary: DownloadSummary = {
@@ -62,6 +68,10 @@ export function resolveInsideRoot(root: string, relativePath: string) {
   return resolvedPath;
 }
 
+export function sanitizeUserFolder(email: string) {
+  return email.toLowerCase().replace(/[^a-z0-9._-]+/g, '_').replace(/^[._-]+|[._-]+$/g, '') || 'user';
+}
+
 class ServerOneDriveClient {
   constructor(private readonly getAccessToken: () => Promise<string>) {}
 
@@ -74,6 +84,23 @@ class ServerOneDriveClient {
       ? '/me/drive/root/children'
       : `/me/drive/items/${folderId}/children`;
     return this.readPagedItems(endpoint);
+  }
+
+  async delta(token?: string) {
+    const endpoint = token || '/me/drive/root/delta?$select=id,name,size,eTag,cTag,lastModifiedDateTime,folder,file,package,parentReference&$top=200';
+    let response = await this.graphGet(endpoint);
+    const items: RemoteItemMetadata[] = [];
+    let deltaToken: string | undefined;
+
+    while (response) {
+      for (const item of response.value || []) {
+        if (!item.deleted && !item.folder && !item.package) items.push(this.normalizeItem(item));
+      }
+      deltaToken = response['@odata.deltaLink'];
+      response = response['@odata.nextLink'] ? await this.graphGet(response['@odata.nextLink']) : null;
+    }
+
+    return { items, deltaToken };
   }
 
   async refreshDownloadUrl(itemId: string) {
@@ -133,54 +160,94 @@ class ServerOneDriveClient {
 
 export class ServerDownloadManager {
   private jobs = new Map<string, ServerDownloadJob>();
+  private activeJobIds = new Set<string>();
 
-  constructor(private readonly targetRoot?: string) {}
+  constructor(
+    private readonly targetRoot?: string,
+    private readonly store?: ServerStateStore,
+  ) {
+    this.store?.markActiveJobsInterrupted();
+  }
 
   get configuredRoot() {
     return this.targetRoot;
   }
 
-  listJobs() {
-    return Array.from(this.jobs.values()).map(job => this.publicJob(job));
+  targetRootForUser(userEmail: string) {
+    return this.userTargetRoot(userEmail);
   }
 
-  getJob(id: string) {
-    const job = this.jobs.get(id);
-    return job ? this.publicJob(job) : undefined;
+  listJobs(userEmail: string) {
+    if (this.store) return this.store.listJobs(userEmail).map(job => this.publicJob(job));
+    return Array.from(this.jobs.values())
+      .filter(job => job.userEmail === userEmail)
+      .map(job => this.publicJob(job));
   }
 
-  cancel(id: string) {
+  getJob(userEmail: string, id: string) {
     const job = this.jobs.get(id);
-    if (!job) return false;
+    if (job?.userEmail === userEmail) return this.publicJob(job);
+    const persisted = this.store?.getJob(userEmail, id);
+    return persisted ? this.publicJob(persisted) : undefined;
+  }
+
+  cancel(userEmail: string, id: string) {
+    const job = this.jobs.get(id);
+    if (!job || job.userEmail !== userEmail) return false;
     job.abortController.abort();
     job.status = 'cancelled';
     job.updatedAt = new Date().toISOString();
     this.log(job, 'Cancelled by user.');
+    this.persist(job);
     return true;
   }
 
   start(
-    mode: 'start' | 'dry-run' | 'repair',
+    user: ServerUser,
+    mode: 'start' | 'dry-run' | 'repair' | 'incremental',
     selections: ServerSourceSelection[],
     settings: Partial<DownloadSettings>,
     getAccessToken: () => Promise<string>,
   ) {
     if (!this.targetRoot) throw new Error('SERVER_DOWNLOAD_ROOT is not configured.');
-    const job = this.createJob(mode);
+    if (mode !== 'incremental' && selections.length === 0) {
+      throw new Error('Select OneDrive files or folders before starting a server job.');
+    }
+    const job = this.createJob(user, mode, selections, settings as Record<string, unknown>);
     this.jobs.set(job.id, job);
-    void this.run(job, selections, settings, getAccessToken);
+    this.persist(job);
+    void this.run(job, getAccessToken);
     return this.publicJob(job);
   }
 
-  private createJob(mode: ServerDownloadJob['mode']): ServerDownloadJob {
+  resumeForUser(userEmail: string, getAccessToken: () => Promise<string>) {
+    const jobs = this.store?.listResumableJobs(userEmail) || [];
+    for (const persisted of jobs) {
+      if (this.activeJobIds.has(persisted.id)) continue;
+      const job = this.fromPersistedJob(persisted);
+      this.jobs.set(job.id, job);
+      this.log(job, 'Resuming server job after reconnect.');
+      void this.run(job, getAccessToken);
+    }
+  }
+
+  private createJob(
+    user: ServerUser,
+    mode: ServerDownloadJob['mode'],
+    selections: ServerSourceSelection[],
+    settings: Record<string, unknown>,
+  ): ServerDownloadJob {
     const now = new Date().toISOString();
     return {
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      userEmail: user.email,
       mode,
       status: 'queued',
       createdAt: now,
       updatedAt: now,
-      targetRoot: this.targetRoot || '',
+      targetRoot: this.userTargetRoot(user.email),
+      selections,
+      settings,
       log: [],
       abortController: new AbortController(),
       snapshot: {
@@ -197,19 +264,25 @@ export class ServerDownloadManager {
     };
   }
 
-  private async run(
-    job: ServerDownloadJob,
-    selections: ServerSourceSelection[],
-    partialSettings: Partial<DownloadSettings>,
-    getAccessToken: () => Promise<string>,
-  ) {
-    const settings = { ...defaultDownloadSettings, ...partialSettings };
+  private fromPersistedJob(job: PersistedServerJob): ServerDownloadJob {
+    return {
+      ...job,
+      abortController: new AbortController(),
+    };
+  }
+
+  private async run(job: ServerDownloadJob, getAccessToken: () => Promise<string>) {
+    if (this.activeJobIds.has(job.id)) return;
+    this.activeJobIds.add(job.id);
+    const settings = { ...defaultDownloadSettings, ...job.settings };
     const oneDrive = new ServerOneDriveClient(getAccessToken);
     try {
       job.status = 'scanning';
       job.snapshot.status = 'scanning';
-      this.log(job, `Scanning ${selections.length} selected item${selections.length === 1 ? '' : 's'}...`);
-      const items = await this.scanSelections(oneDrive, selections, [], settings, job);
+      this.persist(job);
+      const items = job.mode === 'incremental'
+        ? await this.scanIncremental(oneDrive, job)
+        : await this.scanSelections(oneDrive, job.selections, [], settings, job);
       const runnable = job.mode === 'repair'
         ? await this.filterMissingOrChanged(items, job)
         : items;
@@ -219,11 +292,13 @@ export class ServerDownloadManager {
       if (job.mode === 'dry-run') {
         job.status = 'completed';
         this.log(job, `Dry run found ${runnable.length} file${runnable.length === 1 ? '' : 's'} and ${job.snapshot.totalBytes} bytes.`);
+        this.persist(job);
         return;
       }
-      this.log(job, `${job.mode === 'repair' ? 'Repair' : 'Archive'} queued ${runnable.length} file${runnable.length === 1 ? '' : 's'}.`);
+      this.log(job, `${job.mode === 'repair' ? 'Repair' : job.mode === 'incremental' ? 'Incremental archive' : 'Archive'} queued ${runnable.length} file${runnable.length === 1 ? '' : 's'}.`);
       job.status = 'downloading';
       job.snapshot.status = 'downloading';
+      this.persist(job);
       for (const item of runnable) {
         if (job.abortController.signal.aborted) throw new DOMException('Operation cancelled', 'AbortError');
         await this.downloadItem(oneDrive, item, settings, job);
@@ -231,6 +306,10 @@ export class ServerDownloadManager {
       job.status = 'completed';
       job.snapshot.status = 'completed';
       job.snapshot.stagePercent = 100;
+      if (job.mode === 'incremental' && job.snapshot.failedFiles === 0 && job.nextDeltaToken) {
+        this.store?.saveDeltaToken(job.userEmail, job.nextDeltaToken);
+        this.log(job, 'Saved OneDrive delta token after successful incremental archive.');
+      }
       this.log(job, `Completed ${job.snapshot.completedFiles} file${job.snapshot.completedFiles === 1 ? '' : 's'} with ${job.snapshot.failedFiles} failure${job.snapshot.failedFiles === 1 ? '' : 's'}.`);
     } catch (error) {
       if (job.abortController.signal.aborted) {
@@ -245,7 +324,29 @@ export class ServerDownloadManager {
       }
     } finally {
       job.updatedAt = new Date().toISOString();
+      this.persist(job);
+      this.activeJobIds.delete(job.id);
     }
+  }
+
+  private async scanIncremental(oneDrive: ServerOneDriveClient, job: ServerDownloadJob) {
+    this.log(job, 'Checking OneDrive delta changes...');
+    const token = this.store?.getDeltaToken(job.userEmail);
+    this.log(job, token ? 'Using saved OneDrive delta token.' : 'No saved delta token found; creating baseline.');
+    const delta = await oneDrive.delta(token);
+    job.nextDeltaToken = delta.deltaToken;
+    if (!token) {
+      if (delta.deltaToken) this.store?.saveDeltaToken(job.userEmail, delta.deltaToken);
+      this.log(job, 'Baseline delta token saved. Incremental archive will download changes from the next run.');
+      return [];
+    }
+    this.log(job, `OneDrive delta returned ${delta.items.length} changed file${delta.items.length === 1 ? '' : 's'}.`);
+    return delta.items.map(item => {
+      const remotePath = item.remotePath.includes('/root:')
+        ? item.remotePath.split('/root:').pop() || item.name
+        : item.remotePath;
+      return { ...item, remotePath: normalizeRelativePath([remotePath]) };
+    });
   }
 
   private async scanSelections(
@@ -272,6 +373,7 @@ export class ServerDownloadManager {
       }
       job.snapshot.stagePercent = Math.min(job.snapshot.stagePercent + 1, 99);
       job.updatedAt = new Date().toISOString();
+      this.persist(job);
     }
     return items;
   }
@@ -306,6 +408,7 @@ export class ServerDownloadManager {
     if (!finalPath) {
       job.snapshot.completedFiles += 1;
       job.updatedAt = new Date().toISOString();
+      this.persist(job);
       return;
     }
     const partialPath = `${finalPath}.partial`;
@@ -327,6 +430,7 @@ export class ServerDownloadManager {
       : 100;
     job.snapshot.summary.downloaded += 1;
     job.updatedAt = new Date().toISOString();
+    this.persist(job);
   }
 
   private async resolveFinalPath(item: RemoteItemMetadata, settings: DownloadSettings, job: ServerDownloadJob) {
@@ -361,9 +465,31 @@ export class ServerDownloadManager {
     job.log.unshift(`${new Date().toLocaleTimeString()} ${message}`);
     job.log = job.log.slice(0, 200);
     job.updatedAt = new Date().toISOString();
+    this.persist(job);
   }
 
-  private publicJob(job: ServerDownloadJob) {
+  private userTargetRoot(userEmail: string) {
+    if (!this.targetRoot) return '';
+    return path.join(this.targetRoot, 'users', sanitizeUserFolder(userEmail));
+  }
+
+  private persist(job: ServerDownloadJob) {
+    this.store?.updateJob({
+      id: job.id,
+      userEmail: job.userEmail,
+      mode: job.mode,
+      status: job.status,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      targetRoot: job.targetRoot,
+      selections: job.selections,
+      settings: job.settings,
+      log: job.log,
+      snapshot: job.snapshot,
+    });
+  }
+
+  private publicJob(job: ServerDownloadJob | PersistedServerJob) {
     return {
       id: job.id,
       mode: job.mode,

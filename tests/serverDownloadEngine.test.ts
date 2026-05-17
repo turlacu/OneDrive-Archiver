@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import path from 'node:path';
-import { resolveInsideRoot } from '../src/server/serverDownloadEngine.ts';
+import { resolveInsideRoot, sanitizeUserFolder } from '../src/server/serverDownloadEngine.ts';
 
 test('resolves server download paths inside the configured root', () => {
   const root = path.resolve('/tmp/syncpoint-root');
@@ -15,4 +15,10 @@ test('rejects server download paths escaping the configured root', () => {
   const root = path.resolve('/tmp/syncpoint-root');
   assert.throws(() => resolveInsideRoot(root, '../escape.txt'), /escapes/);
   assert.throws(() => resolveInsideRoot(root, '/etc/passwd'), /escapes/);
+});
+
+test('sanitizes user emails for isolated server folders', () => {
+  assert.equal(sanitizeUserFolder('Owner@Example.COM'), 'owner_example.com');
+  assert.equal(sanitizeUserFolder('bad/user@example.com'), 'bad_user_example.com');
+  assert.equal(sanitizeUserFolder('***'), 'user');
 });

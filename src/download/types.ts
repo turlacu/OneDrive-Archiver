@@ -12,7 +12,8 @@ export type DownloadJobStatus =
   | 'failed'
   | 'stale_remote_changed'
   | 'insufficient_space'
-  | 'cancelled';
+  | 'cancelled'
+  | 'interrupted';
 
 export type ConflictStrategy = 'skip_existing' | 'overwrite' | 'rename_new' | 'keep_newest' | 'keep_both';
 export type DownloadRunMode = 'normal' | 'dry_run' | 'incremental' | 'repair';

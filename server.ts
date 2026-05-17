@@ -9,6 +9,7 @@ import cookieParser from 'cookie-parser';
 import session from 'express-session';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import { ServerDownloadManager } from './src/server/serverDownloadEngine.ts';
+import { ServerStateStore, type ServerUser } from './src/server/serverStateStore.ts';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -32,7 +33,14 @@ const isDevelopment = process.env.NODE_ENV !== 'production';
 const isSecureAppUrl = APP_URL.startsWith('https://');
 const appOrigin = new URL(APP_URL).origin;
 const SERVER_DOWNLOAD_ROOT = process.env.SERVER_DOWNLOAD_ROOT;
-const serverDownloads = new ServerDownloadManager(SERVER_DOWNLOAD_ROOT);
+const APP_DATA_DIR = process.env.APP_DATA_DIR;
+const serverArchiveEnabled = Boolean(SERVER_DOWNLOAD_ROOT);
+const allowedUsers = new Set((process.env.ALLOWED_USERS || '')
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean));
+const serverStateStore = serverArchiveEnabled && APP_DATA_DIR ? new ServerStateStore(APP_DATA_DIR) : undefined;
+const serverDownloads = new ServerDownloadManager(SERVER_DOWNLOAD_ROOT, serverStateStore);
 let msalClient: msal.ConfidentialClientApplication | null = null;
 
 if (!isDevelopment) {
@@ -41,10 +49,16 @@ if (!isDevelopment) {
         (!process.env.SESSION_SECRET || SESSION_SECRET === FALLBACK_SESSION_SECRET) ? 'SESSION_SECRET' : '',
         !CLIENT_ID ? 'MICROSOFT_CLIENT_ID' : '',
         !CLIENT_SECRET ? 'MICROSOFT_CLIENT_SECRET' : '',
+        serverArchiveEnabled && !APP_DATA_DIR ? 'APP_DATA_DIR' : '',
+        serverArchiveEnabled && allowedUsers.size === 0 ? 'ALLOWED_USERS' : '',
     ].filter(Boolean);
     if (missing.length > 0) {
         throw new Error(`Missing required production environment variable${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}`);
     }
+}
+
+if (serverArchiveEnabled && (!APP_DATA_DIR || allowedUsers.size === 0)) {
+    throw new Error('SERVER_DOWNLOAD_ROOT enables server archive mode. Configure APP_DATA_DIR and ALLOWED_USERS.');
 }
 
 function isUsableAccessToken(value: unknown) {
@@ -114,6 +128,47 @@ async function refreshSessionToken(req: express.Request) {
     return session.accessToken;
 }
 
+function sessionUser(req: express.Request): ServerUser | null {
+    const user = (req.session as any).user;
+    return user?.email ? user : null;
+}
+
+function requireAuthenticatedUser(req: express.Request, res: express.Response) {
+    const user = sessionUser(req);
+    if (!user) {
+        res.status(401).json({ error: 'Sign in before using server-side archive jobs.' });
+        return null;
+    }
+    return user;
+}
+
+async function fetchMicrosoftUser(accessToken: string) {
+    const response = await fetch('https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,userPrincipalName', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!response.ok) throw new Error(`Microsoft Graph /me ${response.status}: ${await response.text()}`);
+    const me = await response.json();
+    const email = String(me.mail || me.userPrincipalName || '').trim().toLowerCase();
+    if (!email) throw new Error('Microsoft account did not return an email or user principal name.');
+    return {
+        email,
+        displayName: typeof me.displayName === 'string' ? me.displayName : email,
+    };
+}
+
+function ensureUserAllowed(user: ServerUser) {
+    if (serverArchiveEnabled && !allowedUsers.has(user.email)) {
+        throw new Error(`Microsoft account ${user.email} is not allowed to use this server archive app.`);
+    }
+}
+
+function resumeUserJobs(req: express.Request) {
+    const user = sessionUser(req);
+    if (!user || !serverArchiveEnabled) return;
+    const getAccessToken = async () => refreshSessionToken(req);
+    serverDownloads.resumeForUser(user.email, getAccessToken);
+}
+
 async function startServer() {
     const app = express();
     const PORT = Number(process.env.PORT || 3000);
@@ -159,8 +214,9 @@ async function startServer() {
             }
             refreshSessionToken(req)
                 .then(accessToken => {
+                    resumeUserJobs(req);
                     console.log('[AUTH-DEBUG] Session token found for status check');
-                    res.json({ authenticated: true, accessToken });
+                    res.json({ authenticated: true, accessToken, user: session.user || null });
                 })
                 .catch(error => {
                     console.error('[AUTH-DEBUG] Token refresh failed:', error);
@@ -180,7 +236,8 @@ async function startServer() {
             if (!isUsableAccessToken(accessToken)) {
                 return res.status(401).json({ error: 'No valid Microsoft access token in session' });
             }
-            res.json({ accessToken });
+            resumeUserJobs(req);
+            res.json({ accessToken, user: sessionUser(req) });
         } catch (error) {
             console.error('[AUTH-DEBUG] Token endpoint refresh failed:', error);
             req.session.destroy(() => {
@@ -198,8 +255,8 @@ async function startServer() {
     });
 
     function requireServerDownloadRoot(res: express.Response) {
-        if (!SERVER_DOWNLOAD_ROOT) {
-            res.status(400).json({ error: 'SERVER_DOWNLOAD_ROOT is not configured on this server.' });
+        if (!serverArchiveEnabled) {
+            res.status(400).json({ error: 'Server archive mode is disabled. Set SERVER_DOWNLOAD_ROOT, APP_DATA_DIR, and ALLOWED_USERS to enable it.' });
             return false;
         }
         return true;
@@ -220,39 +277,54 @@ async function startServer() {
     }
 
     app.get('/api/server-jobs/config', (_req, res) => {
+        const user = sessionUser(_req);
         res.json({
-            configured: Boolean(SERVER_DOWNLOAD_ROOT),
-            targetRoot: SERVER_DOWNLOAD_ROOT || null,
+            enabled: serverArchiveEnabled,
+            configured: serverArchiveEnabled,
+            targetRoot: serverArchiveEnabled && user ? serverDownloads.targetRootForUser(user.email) : SERVER_DOWNLOAD_ROOT || null,
+            requiresAllowedUsers: serverArchiveEnabled,
         });
     });
 
-    app.get('/api/server-jobs', (_req, res) => {
-        res.json({ jobs: serverDownloads.listJobs() });
+    app.get('/api/server-jobs', (req, res) => {
+        if (!requireServerDownloadRoot(res)) return;
+        const user = requireAuthenticatedUser(req, res);
+        if (!user) return;
+        resumeUserJobs(req);
+        res.json({ jobs: serverDownloads.listJobs(user.email) });
     });
 
     app.get('/api/server-jobs/:id', (req, res) => {
-        const job = serverDownloads.getJob(req.params.id);
+        if (!requireServerDownloadRoot(res)) return;
+        const user = requireAuthenticatedUser(req, res);
+        if (!user) return;
+        const job = serverDownloads.getJob(user.email, req.params.id);
         if (!job) return res.status(404).json({ error: 'Server job not found.' });
         res.json({ job });
     });
 
     app.post('/api/server-jobs/:id/cancel', (req, res) => {
-        const cancelled = serverDownloads.cancel(req.params.id);
+        if (!requireServerDownloadRoot(res)) return;
+        const user = requireAuthenticatedUser(req, res);
+        if (!user) return;
+        const cancelled = serverDownloads.cancel(user.email, req.params.id);
         if (!cancelled) return res.status(404).json({ error: 'Server job not found.' });
         res.json({ ok: true });
     });
 
-    async function startServerJob(req: express.Request, res: express.Response, mode: 'start' | 'dry-run' | 'repair') {
+    async function startServerJob(req: express.Request, res: express.Response, mode: 'start' | 'dry-run' | 'repair' | 'incremental') {
         if (!requireServerDownloadRoot(res)) return;
+        const user = requireAuthenticatedUser(req, res);
+        if (!user) return;
         const accessToken = await requireAccessToken(req, res);
         if (!accessToken) return;
         const selections = Array.isArray(req.body?.selections) ? req.body.selections : [];
-        if (selections.length === 0) {
+        if (mode !== 'incremental' && selections.length === 0) {
             return res.status(400).json({ error: 'Select OneDrive files or folders before starting a server job.' });
         }
         const getAccessToken = async () => refreshSessionToken(req);
         try {
-            const job = serverDownloads.start(mode, selections, req.body?.settings || {}, getAccessToken);
+            const job = serverDownloads.start(user, mode, selections, req.body?.settings || {}, getAccessToken);
             res.json({ job });
         } catch (error) {
             res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
@@ -262,6 +334,7 @@ async function startServer() {
     app.post('/api/server-jobs/start', (req, res) => startServerJob(req, res, 'start'));
     app.post('/api/server-jobs/dry-run', (req, res) => startServerJob(req, res, 'dry-run'));
     app.post('/api/server-jobs/repair', (req, res) => startServerJob(req, res, 'repair'));
+    app.post('/api/server-jobs/incremental', (req, res) => startServerJob(req, res, 'incremental'));
 
     app.get('/api/auth/url', async (req, res) => {
         console.log('[AUTH-DEBUG] Generating auth URL');
@@ -326,12 +399,16 @@ async function startServer() {
                 console.error('[AUTH-DEBUG] MSAL returned an unusable access token');
                 return res.status(500).send('Authentication failed: Microsoft did not return a usable Graph access token.');
             }
+            const user = await fetchMicrosoftUser(accessToken);
+            ensureUserAllowed(user);
+            serverStateStore?.upsertUser(user);
             console.log('[AUTH-DEBUG] Token acquired successfully');
 
             // Save to session for polling fallback
             (req.session as any).accessToken = accessToken;
             (req.session as any).expiresAt = response.expiresOn?.getTime() || Date.now() + 45 * 60 * 1000;
             (req.session as any).account = response.account;
+            (req.session as any).user = user;
             req.session.save((sessionError) => {
                 if (sessionError) {
                     console.error('[AUTH-DEBUG] Session save error:', sessionError);

@@ -5,7 +5,7 @@ export interface ExplorerItem {
   name: string;
   size: number;
   type: 'file' | 'folder';
-  status: 'pending' | 'scanning' | 'downloading' | 'completed' | 'error' | 'skipped' | 'verifying' | 'queued' | 'paused' | 'retrying' | 'throttled' | 'failed' | 'stale_remote_changed' | 'insufficient_space' | 'cancelled';
+  status: 'pending' | 'scanning' | 'downloading' | 'completed' | 'error' | 'skipped' | 'verifying' | 'queued' | 'paused' | 'retrying' | 'throttled' | 'failed' | 'stale_remote_changed' | 'insufficient_space' | 'cancelled' | 'interrupted';
   progress: number;
 }
 

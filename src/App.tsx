@@ -30,7 +30,7 @@ interface SyncItem {
   size: number;
   path: string;
   type: 'file' | 'folder';
-  status: 'pending' | 'scanning' | 'downloading' | 'completed' | 'error' | 'skipped' | 'verifying' | 'queued' | 'paused' | 'retrying' | 'throttled' | 'failed' | 'stale_remote_changed' | 'insufficient_space' | 'cancelled';
+  status: 'pending' | 'scanning' | 'downloading' | 'completed' | 'error' | 'skipped' | 'verifying' | 'queued' | 'paused' | 'retrying' | 'throttled' | 'failed' | 'stale_remote_changed' | 'insufficient_space' | 'cancelled' | 'interrupted';
   progress: number;
   sha1Hash?: string;
   error?: string;
@@ -89,8 +89,8 @@ interface FailedFile {
 
 interface ServerArchiveJob {
   id: string;
-  mode: 'start' | 'dry-run' | 'repair';
-  status: 'queued' | 'scanning' | 'downloading' | 'completed' | 'failed' | 'cancelled';
+  mode: 'start' | 'dry-run' | 'repair' | 'incremental';
+  status: 'queued' | 'scanning' | 'downloading' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
   targetRoot: string;
   log: string[];
   snapshot: DownloadProgressSnapshot;
@@ -121,6 +121,7 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeSearchQuery, setActiveSearchQuery] = useState('');
   const [targetMode, setTargetMode] = useState<'browser' | 'server'>('browser');
+  const [serverArchiveEnabled, setServerArchiveEnabled] = useState(false);
   const [serverTargetRoot, setServerTargetRoot] = useState<string | null>(null);
   const [serverJobs, setServerJobs] = useState<ServerArchiveJob[]>([]);
   const [activeServerJobId, setActiveServerJobId] = useState<string | null>(null);
@@ -135,10 +136,23 @@ export default function App() {
     localStorage.setItem('theme', theme);
   }, [theme]);
 
+  const refreshServerConfig = async () => {
+    try {
+      const res = await axios.get('/api/server-jobs/config');
+      const enabled = Boolean(res.data?.enabled);
+      setServerArchiveEnabled(enabled);
+      setServerTargetRoot(enabled ? (res.data?.targetRoot || null) : null);
+      if (enabled) setTargetMode('server');
+      else setTargetMode('browser');
+    } catch {
+      setServerArchiveEnabled(false);
+      setServerTargetRoot(null);
+      setTargetMode('browser');
+    }
+  };
+
   useEffect(() => {
-    axios.get('/api/server-jobs/config')
-      .then(res => setServerTargetRoot(res.data?.targetRoot || null))
-      .catch(() => setServerTargetRoot(null));
+    refreshServerConfig();
   }, []);
 
   function isUsableAccessToken(value: string | null | undefined) {
@@ -178,6 +192,8 @@ export default function App() {
       }
       accessTokenRef.current = token;
       setAccessToken(token);
+      if (res.data?.user) setUser(res.data.user);
+      await refreshServerConfig();
       addLog('Microsoft access token refreshed.');
       return token;
     } catch (error: any) {
@@ -195,6 +211,8 @@ export default function App() {
       if (!isUsableAccessToken(token)) return false;
       accessTokenRef.current = token;
       setAccessToken(token);
+      if (res.data?.user) setUser(res.data.user);
+      await refreshServerConfig();
       addLog('Authentication successful');
       return true;
     } catch {
@@ -382,7 +400,7 @@ export default function App() {
     await fetchFolderItems(folder.id, folder.name);
   };
 
-  const openFolderFromItem = async (item: SyncItem) => {
+  const openFolderFromItem = async (item: { id: string; name: string; type: 'file' | 'folder' }) => {
     if (item.type !== 'folder' || isSyncing) return;
     await openFolder({ id: item.id, name: item.name });
   };
@@ -580,6 +598,7 @@ export default function App() {
   };
 
   const refreshServerJobs = async () => {
+    if (!serverArchiveEnabled) return;
     try {
       const res = await axios.get('/api/server-jobs');
       setServerJobs(res.data?.jobs || []);
@@ -592,7 +611,7 @@ export default function App() {
     refreshServerJobs();
     const interval = setInterval(refreshServerJobs, 2000);
     return () => clearInterval(interval);
-  }, []);
+  }, [serverArchiveEnabled]);
 
   const handleEngineEvent = (event: ReporterEvent) => {
     if (event.type === 'log') {
@@ -824,15 +843,17 @@ export default function App() {
     }));
   };
 
-  const startServerArchiveJob = async (mode: 'start' | 'dry-run' | 'repair') => {
+  const startServerArchiveJob = async (mode: 'start' | 'dry-run' | 'repair' | 'incremental') => {
     if (!serverTargetRoot) return alert('SERVER_DOWNLOAD_ROOT is not configured on the server.');
     if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
-    if (selection.size === 0) return alert('Select OneDrive files or folders first');
+    if (mode !== 'incremental' && selection.size === 0) return alert('Select OneDrive files or folders first');
     const endpoint = mode === 'start'
       ? '/api/server-jobs/start'
       : mode === 'dry-run'
         ? '/api/server-jobs/dry-run'
-        : '/api/server-jobs/repair';
+        : mode === 'repair'
+          ? '/api/server-jobs/repair'
+          : '/api/server-jobs/incremental';
     addLog(`Starting server ${mode === 'start' ? 'archive' : mode} job...`);
     try {
       const res = await axios.post(endpoint, {
@@ -1036,8 +1057,9 @@ export default function App() {
               </button>
               <button
                 onClick={() => setTargetMode('server')}
+                disabled={!serverArchiveEnabled}
                 className={`py-1.5 rounded text-[10px] font-bold uppercase ${targetMode === 'server' ? 'bg-blue-50 dark:bg-neutral-800 text-blue-700 dark:text-neutral-100' : 'text-slate-500 dark:text-neutral-400 border border-slate-200 dark:border-neutral-700'}`}
-                title="Write downloads on the server under SERVER_DOWNLOAD_ROOT."
+                title={serverArchiveEnabled ? 'Write downloads on the server under SERVER_DOWNLOAD_ROOT.' : 'Server archive mode is disabled on this deployment.'}
               >
                 Server
               </button>
@@ -1056,7 +1078,7 @@ export default function App() {
                   {localDir ? 'Browser target ready' : 'Select browser destination'}
                 </p>
               </div>
-            ) : (
+            ) : serverArchiveEnabled ? (
               <div className={`p-4 border rounded-lg ${serverTargetRoot ? 'border-slate-300 bg-slate-50 dark:bg-neutral-800/60 dark:border-neutral-700' : 'border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30'}`}>
                 <div className="flex items-center gap-2 mb-1">
                   <HardDrive size={16} className={serverTargetRoot ? 'text-blue-600 dark:text-blue-400' : 'text-red-500'} />
@@ -1064,6 +1086,16 @@ export default function App() {
                 </div>
                 <p className="text-[10px] text-slate-500 dark:text-neutral-400 leading-tight">
                   {serverTargetRoot ? 'Server target configured' : 'Set SERVER_DOWNLOAD_ROOT in the server environment'}
+                </p>
+              </div>
+            ) : (
+              <div className="p-4 border rounded-lg border-slate-200 dark:border-neutral-700 bg-slate-50 dark:bg-neutral-800/60">
+                <div className="flex items-center gap-2 mb-1">
+                  <HardDrive size={16} className="text-slate-400 dark:text-neutral-500" />
+                  <span className="text-xs font-bold truncate">Browser-only deployment</span>
+                </div>
+                <p className="text-[10px] text-slate-500 dark:text-neutral-400 leading-tight">
+                  Server downloads are disabled
                 </p>
               </div>
             )}
@@ -1378,9 +1410,9 @@ export default function App() {
                         Dry Run
                       </button>
                       <button
-                        onClick={startIncrementalArchive}
-                        disabled={targetMode === 'server' || !accessToken || !localDir}
-                        title={targetMode === 'server' ? 'Server-side incremental archive is not available in this version.' : 'Archive only OneDrive files that changed since the last saved incremental scan.'}
+                        onClick={targetMode === 'server' ? () => startServerArchiveJob('incremental') : startIncrementalArchive}
+                        disabled={!accessToken || (targetMode === 'browser' ? !localDir : !serverTargetRoot)}
+                        title={targetMode === 'server' ? 'Archive changed OneDrive files on the server from the saved delta state.' : 'Archive only OneDrive files that changed since the last saved incremental scan.'}
                         className="min-w-0 px-1 py-2 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 rounded font-bold text-[9px] uppercase leading-tight hover:bg-slate-50 dark:hover:bg-neutral-800 disabled:text-slate-400 dark:disabled:text-neutral-500 whitespace-normal break-words"
                       >
                         Incremental

@@ -77,6 +77,8 @@ Optional local server-target testing:
 
 ```env
 SERVER_DOWNLOAD_ROOT=/tmp/onedrive-archive
+APP_DATA_DIR=/tmp/onedrive-archiver-config
+ALLOWED_USERS=your-microsoft-email@example.com
 ```
 
 Then choose `Server` in the Archive Target panel.
@@ -105,13 +107,15 @@ To enable server-side downloads in Coolify, mount a persistent volume into the c
 
 ```env
 SERVER_DOWNLOAD_ROOT=/downloads/onedrive-archive
+APP_DATA_DIR=/config
+ALLOWED_USERS=you@example.com
 ```
 
-The app will only write inside `SERVER_DOWNLOAD_ROOT`.
+The app will only write archived files inside `SERVER_DOWNLOAD_ROOT`. When `SERVER_DOWNLOAD_ROOT` is set, server archive mode is enabled and `ALLOWED_USERS` is required. If you leave `SERVER_DOWNLOAD_ROOT` unset, the app runs in browser-only mode and downloads stay on the user's local PC.
 
 ## UNRAID Deployment
 
-Use server-target mode when you want downloads to land on the UNRAID server rather than the browser PC.
+Unraid installs are server archive deployments. Downloads land on the Unraid server, jobs are persisted under `/config`, and only Microsoft accounts listed in `ALLOWED_USERS` can use the app.
 
 ### Requirements
 
@@ -119,6 +123,7 @@ Use server-target mode when you want downloads to land on the UNRAID server rath
 - A Microsoft Azure app registration with a Web redirect URI.
 - A public HTTPS URL for the app, usually through a reverse proxy. Microsoft only allows `http://` redirect URIs for localhost development.
 - A long random `SESSION_SECRET`.
+- An `ALLOWED_USERS` value with the Microsoft email addresses allowed to use this server.
 
 Recommended image:
 
@@ -136,6 +141,12 @@ Recommended archive path inside the container:
 
 ```txt
 /downloads/onedrive-archive
+```
+
+Recommended app data path inside the container:
+
+```txt
+/config
 ```
 
 ### Install with the bundled Unraid template
@@ -163,7 +174,7 @@ Then create the container:
 1. In the Unraid WebGUI, open the Docker tab.
 2. Click `Add Container`.
 3. Select `OneDrive-Archiver` from the template dropdown.
-4. Fill in `APP_URL`, `SESSION_SECRET`, `MICROSOFT_CLIENT_ID`, and `MICROSOFT_CLIENT_SECRET`.
+4. Fill in `APP_URL`, `SESSION_SECRET`, `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, and `ALLOWED_USERS`.
 5. Adjust the host archive path if needed.
 6. Click `Apply`.
 
@@ -172,11 +183,14 @@ The template provides these visible settings:
 ```txt
 Web Interface Port
 Archive Download Path
+App Data Path
 APP_URL
 SESSION_SECRET
 MICROSOFT_CLIENT_ID
 MICROSOFT_CLIENT_SECRET
 SERVER_DOWNLOAD_ROOT
+APP_DATA_DIR
+ALLOWED_USERS
 ```
 
 Advanced settings are also included:
@@ -221,6 +235,14 @@ Container path: /downloads/onedrive-archive
 Access mode:    Read/Write
 ```
 
+App data mapping:
+
+```txt
+Host path:      /mnt/user/appdata/onedrive-archiver
+Container path: /config
+Access mode:    Read/Write
+```
+
 Environment variables:
 
 ```env
@@ -230,6 +252,8 @@ SESSION_SECRET=replace-with-a-long-random-string
 MICROSOFT_CLIENT_ID=your-app-client-id
 MICROSOFT_CLIENT_SECRET=your-client-secret-value
 SERVER_DOWNLOAD_ROOT=/downloads/onedrive-archive
+APP_DATA_DIR=/config
+ALLOWED_USERS=you@example.com,other@example.com
 PUID=99
 PGID=100
 UMASK=022
@@ -282,10 +306,10 @@ Usage:
 2. Sign in to Microsoft.
 3. Select `Server` in Archive Target.
 4. Select OneDrive files or folders.
-5. Click `Start Archive`, `Dry Run`, or `Repair`.
+5. Click `Start Archive`, `Dry Run`, `Incremental`, or `Repair`.
 6. You may close the browser after the server job starts. The server continues the job while the container remains running.
 
-Server jobs are in memory in this version. They continue after the browser closes, but they do not survive a container/server restart.
+Server jobs, logs, and incremental delta tokens are persisted in `APP_DATA_DIR`. If the container restarts while a job is active, the job is marked interrupted and resumes when the owning user signs in again.
 
 ## Target Modes
 
@@ -306,15 +330,23 @@ Available actions:
 
 Downloads are written by the Node server into `SERVER_DOWNLOAD_ROOT`.
 
+Each allowed user writes under:
+
+```txt
+SERVER_DOWNLOAD_ROOT/users/<user-email>/
+```
+
+The folder name is sanitized for filesystem safety.
+
 Available actions:
 
 - `Start Archive`
 - `Dry Run`
 - `Repair`
+- `Incremental`
 - cancel running server job
 - reconnect to active server job progress after page reload
-
-Server-side `Incremental` is not enabled in this version.
+- reconnect to interrupted jobs after signing in again
 
 ## Validation
 
