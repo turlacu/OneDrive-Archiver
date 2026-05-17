@@ -851,7 +851,7 @@ export default function App() {
   const startServerArchiveJob = async (mode: 'start' | 'dry-run' | 'repair' | 'incremental') => {
     if (!serverTargetRoot) return alert('SERVER_DOWNLOAD_ROOT is not configured on the server.');
     if (!oneDriveClient.current) return alert('Sign in to OneDrive first');
-    if (mode !== 'incremental' && selection.size === 0) return alert('Select OneDrive files or folders first');
+    if (mode !== 'incremental' && mode !== 'repair' && selection.size === 0) return alert('Select OneDrive files or folders first');
     const endpoint = mode === 'start'
       ? '/api/server-jobs/start'
       : mode === 'dry-run'
@@ -1425,8 +1425,8 @@ export default function App() {
                       </button>
                       <button
                         onClick={targetMode === 'server' ? () => startServerArchiveJob('repair') : repairArchive}
-                        disabled={!accessToken || (targetMode === 'browser' ? !localDir : (!serverTargetRoot || selection.size === 0))}
-                        title={targetMode === 'server' ? 'Server-side repair scans the selected OneDrive items and redownloads missing or size-mismatched files.' : 'With a selection, scan selected OneDrive items and redownload missing/unverified local files. Without a selection, use saved repair records.'}
+                        disabled={!accessToken || (targetMode === 'browser' ? !localDir : !serverTargetRoot)}
+                        title={targetMode === 'server' ? 'With a selection, repair those OneDrive items on the server. Without a selection, use saved server archive records.' : 'With a selection, scan selected OneDrive items and redownload missing/unverified local files. Without a selection, use saved repair records.'}
                         className="min-w-0 px-1 py-2 border border-slate-200 dark:border-neutral-700 text-slate-700 dark:text-neutral-100 rounded font-bold text-[9px] uppercase leading-tight hover:bg-slate-50 dark:hover:bg-neutral-800 disabled:text-slate-400 dark:disabled:text-neutral-500 whitespace-normal break-words"
                       >
                         Repair

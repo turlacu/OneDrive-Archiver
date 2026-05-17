@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { DownloadProgressSnapshot } from '../download/types';
+import type { DownloadProgressSnapshot, RemoteItemMetadata } from '../download/types';
 import type { ServerSourceSelection } from './serverDownloadEngine';
 
 export interface ServerUser {
@@ -23,6 +23,15 @@ export interface PersistedServerJob {
   snapshot: DownloadProgressSnapshot;
 }
 
+export interface ServerArchiveRecord {
+  userEmail: string;
+  item: RemoteItemMetadata;
+  localPath: string;
+  status: 'completed' | 'skipped';
+  verificationMessage?: string;
+  updatedAt: string;
+}
+
 interface JobRow {
   id: string;
   user_email: string;
@@ -35,6 +44,17 @@ interface JobRow {
   settings_json: string;
   log_json: string;
   snapshot_json: string;
+}
+
+interface ArchiveRecordRow {
+  user_email: string;
+  remote_path: string;
+  item_id: string;
+  local_path: string;
+  status: ServerArchiveRecord['status'];
+  verification_message: string | null;
+  item_json: string;
+  updated_at: string;
 }
 
 export class ServerStateStore {
@@ -72,6 +92,21 @@ export class ServerStateStore {
         token TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS server_archive_records (
+        user_email TEXT NOT NULL,
+        remote_path TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        local_path TEXT NOT NULL,
+        status TEXT NOT NULL,
+        verification_message TEXT,
+        item_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_email, remote_path)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_server_archive_records_user_updated
+        ON server_archive_records(user_email, updated_at DESC);
     `);
   }
 
@@ -174,6 +209,42 @@ export class ServerStateStore {
     `).run(userEmail, token, new Date().toISOString());
   }
 
+  upsertArchiveRecord(record: Omit<ServerArchiveRecord, 'updatedAt'> & { updatedAt?: string }) {
+    const updatedAt = record.updatedAt || new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO server_archive_records (
+        user_email, remote_path, item_id, local_path, status,
+        verification_message, item_json, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_email, remote_path) DO UPDATE SET
+        item_id = excluded.item_id,
+        local_path = excluded.local_path,
+        status = excluded.status,
+        verification_message = excluded.verification_message,
+        item_json = excluded.item_json,
+        updated_at = excluded.updated_at
+    `).run(
+      record.userEmail,
+      record.item.remotePath,
+      record.item.itemId,
+      record.localPath,
+      record.status,
+      record.verificationMessage || null,
+      JSON.stringify(record.item),
+      updatedAt,
+    );
+  }
+
+  listArchiveRecords(userEmail: string) {
+    const rows = this.db.prepare(`
+      SELECT * FROM server_archive_records
+      WHERE user_email = ?
+      ORDER BY updated_at DESC
+    `).all(userEmail) as unknown as ArchiveRecordRow[];
+    return rows.map(row => this.rowToArchiveRecord(row));
+  }
+
   private rowToJob(row: JobRow): PersistedServerJob {
     return {
       id: row.id,
@@ -187,6 +258,17 @@ export class ServerStateStore {
       settings: JSON.parse(row.settings_json),
       log: JSON.parse(row.log_json),
       snapshot: JSON.parse(row.snapshot_json),
+    };
+  }
+
+  private rowToArchiveRecord(row: ArchiveRecordRow): ServerArchiveRecord {
+    return {
+      userEmail: row.user_email,
+      item: JSON.parse(row.item_json),
+      localPath: row.local_path,
+      status: row.status,
+      verificationMessage: row.verification_message || undefined,
+      updatedAt: row.updated_at,
     };
   }
 }

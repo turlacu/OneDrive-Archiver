@@ -1,19 +1,7 @@
-const widthInBits = 160;
-const shift = 11;
-
-function base64ToBytes(value: string) {
-  const binary = atob(value);
-  return Uint8Array.from(binary, char => char.charCodeAt(0));
-}
-
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
-}
+import { bytesToBase64, hashMatches, isValidQuickXorHash, quickXorShift, quickXorWidthInBits } from './hashTools';
 
 export async function quickXorHash(file: File | Blob) {
-  const hash = new Uint8Array(widthInBits / 8);
+  const hash = new Uint8Array(quickXorWidthInBits / 8);
   const reader = file.stream().getReader();
   let length = 0;
 
@@ -23,7 +11,7 @@ export async function quickXorHash(file: File | Blob) {
 
     for (let i = 0; i < value.length; i += 1) {
       const byte = value[i];
-      const bitOffset = ((length + i) * shift) % widthInBits;
+      const bitOffset = ((length + i) * quickXorShift) % quickXorWidthInBits;
       const byteOffset = Math.floor(bitOffset / 8);
       const bitRemainder = bitOffset % 8;
 
@@ -51,15 +39,4 @@ export async function sha1Hex(file: File | Blob) {
   return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('').toUpperCase();
 }
 
-export function hashMatches(actual: string, expected: string) {
-  return actual.trim().toLowerCase() === expected.trim().toLowerCase();
-}
-
-export function isValidQuickXorHash(value?: string) {
-  if (!value) return false;
-  try {
-    return base64ToBytes(value).length === 20;
-  } catch {
-    return false;
-  }
-}
+export { hashMatches, isValidQuickXorHash };

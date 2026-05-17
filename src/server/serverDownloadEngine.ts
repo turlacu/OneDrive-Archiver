@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises';
-import { createReadStream, createWriteStream } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -8,6 +7,7 @@ import { normalizeRelativePath, shouldIncludeFile } from '../download/pathTools'
 import { backoffDelayMs, isTransientStatus, parseRetryAfter } from '../download/retry';
 import { defaultDownloadSettings, type DownloadSettings, type DownloadProgressSnapshot, type DownloadSummary, type RemoteHashes, type RemoteItemMetadata } from '../download/types';
 import { ServerStateStore, type PersistedServerJob, type ServerUser } from './serverStateStore';
+import { verifyServerFile, type ServerVerificationResult } from './serverFileVerifier';
 
 export interface ServerSourceSelection {
   id: string;
@@ -60,12 +60,6 @@ const emptySummary: DownloadSummary = {
   conflicts: 0,
   insufficientDiskSpace: 0,
 };
-
-interface ServerVerificationResult {
-  ok: boolean;
-  cryptographic: boolean;
-  message: string;
-}
 
 function sleep(ms: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -240,7 +234,7 @@ export class ServerDownloadManager {
     getAccessToken: () => Promise<string>,
   ) {
     if (!this.targetRoot) throw new Error('SERVER_DOWNLOAD_ROOT is not configured.');
-    if (mode !== 'incremental' && selections.length === 0) {
+    if (mode !== 'incremental' && mode !== 'repair' && selections.length === 0) {
       throw new Error('Select OneDrive files or folders before starting a server job.');
     }
     const job = this.createJob(user, mode, selections, settings as Record<string, unknown>);
@@ -312,9 +306,11 @@ export class ServerDownloadManager {
       this.persist(job);
       const items = job.mode === 'incremental'
         ? await this.scanIncremental(oneDrive, job)
-        : await this.scanSelections(oneDrive, job.selections, [], settings, job);
+        : job.mode === 'repair' && job.selections.length === 0
+          ? this.scanArchiveRecordsForRepair(job)
+          : await this.scanSelections(oneDrive, job.selections, [], settings, job);
       const runnable = job.mode === 'repair'
-        ? await this.filterMissingOrChanged(items, job)
+        ? await this.filterMissingOrChanged(items, job, settings)
         : items;
       if (settings.smallFilesFirst) runnable.sort((a, b) => a.size - b.size);
       job.snapshot.totalBytes = runnable.reduce((total, item) => total + item.size, 0);
@@ -386,14 +382,21 @@ export class ServerDownloadManager {
   ) {
     let attempt = 0;
     while (attempt <= settings.retryCount) {
+      const downloadedBeforeAttempt = job.snapshot.downloadedBytes;
       try {
         await this.downloadItem(oneDrive, item, settings, job);
         return;
       } catch (error) {
         if (job.abortController.signal.aborted) throw error;
+        job.snapshot.downloadedBytes = downloadedBeforeAttempt;
+        job.snapshot.speedBytesPerSecond = 0;
+        job.snapshot.stagePercent = job.snapshot.totalBytes > 0
+          ? Math.min((job.snapshot.downloadedBytes / job.snapshot.totalBytes) * 100, 100)
+          : 0;
         const status = (error as { status?: number }).status;
-        if (!isTransientStatus(status) || attempt >= settings.retryCount) {
-        job.snapshot.failedFiles += 1;
+        const verificationFailed = Boolean((error as { verificationFailed?: boolean }).verificationFailed);
+        if ((!isTransientStatus(status) && !verificationFailed) || attempt >= settings.retryCount) {
+          job.snapshot.failedFiles += 1;
           job.snapshot.summary.failed += 1;
           this.log(job, `Failed ${item.remotePath}: ${error instanceof Error ? error.message : String(error)}`);
           this.persist(job);
@@ -423,6 +426,12 @@ export class ServerDownloadManager {
       const parts = relativePathPartsFromGraphPath(item.remotePath);
       return { ...item, remotePath: normalizeRelativePath(parts.length > 0 ? parts : [item.name]) };
     });
+  }
+
+  private scanArchiveRecordsForRepair(job: ServerDownloadJob) {
+    const records = this.store?.listArchiveRecords(job.userEmail) || [];
+    this.log(job, `Loaded ${records.length} saved server archive record${records.length === 1 ? '' : 's'} for repair.`);
+    return records.map(record => record.item);
   }
 
   private async scanSelections(
@@ -465,13 +474,23 @@ export class ServerDownloadManager {
     items.push({ ...item, remotePath: normalizeRelativePath([...parentParts, item.name]) });
   }
 
-  private async filterMissingOrChanged(items: RemoteItemMetadata[], job: ServerDownloadJob) {
+  private async filterMissingOrChanged(items: RemoteItemMetadata[], job: ServerDownloadJob, settings: DownloadSettings) {
     const missing: RemoteItemMetadata[] = [];
     for (const item of items) {
       const finalPath = resolveInsideRoot(job.targetRoot, item.remotePath);
       try {
         const stat = await fs.stat(finalPath);
-        if (stat.size !== item.size) missing.push(item);
+        if (stat.size !== item.size) {
+          missing.push(item);
+          continue;
+        }
+        if (settings.verifyAfterDownload) {
+          const verification = await verifyServerFile(finalPath, item);
+          if (!verification.ok) {
+            this.log(job, `Repair found invalid file; queueing redownload: ${item.remotePath}`);
+            missing.push(item);
+          }
+        }
       } catch {
         missing.push(item);
       }
@@ -490,6 +509,7 @@ export class ServerDownloadManager {
       job.snapshot.completedFiles += 1;
       job.updatedAt = new Date().toISOString();
       this.persist(job);
+      this.recordArchiveItem(job, item, resolveInsideRoot(job.targetRoot, item.remotePath), 'skipped');
       return;
     }
     const partialPath = `${finalPath}.partial`;
@@ -548,9 +568,13 @@ export class ServerDownloadManager {
     job.snapshot.status = 'verifying';
     this.log(job, `Verifying ${item.remotePath}`);
     const verification = settings.verifyAfterDownload
-      ? await this.verifyServerFile(partialPath, item)
+      ? await verifyServerFile(partialPath, item)
       : { ok: true, cryptographic: false, message: 'Verification disabled by settings.' };
-    if (!verification.ok) throw new Error(verification.message);
+    if (!verification.ok) {
+      const error = new Error(verification.message) as Error & { verificationFailed?: boolean };
+      error.verificationFailed = true;
+      throw error;
+    }
     await fs.rename(partialPath, finalPath);
     if (settings.preserveTimestamps && item.lastModifiedDateTime) {
       const modified = new Date(item.lastModifiedDateTime);
@@ -571,103 +595,28 @@ export class ServerDownloadManager {
     if (verification.cryptographic) job.snapshot.summary.verified += 1;
     job.updatedAt = new Date().toISOString();
     this.persist(job);
+    this.recordArchiveItem(job, item, finalPath, 'completed', verification);
     this.log(job, verification.message);
-  }
-
-  private async verifyServerFile(filePath: string, item: RemoteItemMetadata): Promise<ServerVerificationResult> {
-    const stat = await fs.stat(filePath);
-    if (stat.size !== item.size) {
-      return {
-        ok: false,
-        cryptographic: false,
-        message: `Size mismatch for ${item.remotePath}: expected ${item.size} bytes, wrote ${stat.size} bytes.`,
-      };
-    }
-
-    if (item.hashes.sha1Hash) {
-      const actual = await this.sha1File(filePath);
-      const ok = this.hashMatches(actual, item.hashes.sha1Hash);
-      return {
-        ok,
-        cryptographic: true,
-        message: ok
-          ? `SHA-1 verification passed: ${item.remotePath}`
-          : `SHA-1 verification failed for ${item.remotePath}.`,
-      };
-    }
-
-    if (this.isValidQuickXorHash(item.hashes.quickXorHash)) {
-      const actual = await this.quickXorHashFile(filePath);
-      const ok = this.hashMatches(actual, item.hashes.quickXorHash || '');
-      return {
-        ok,
-        cryptographic: true,
-        message: ok
-          ? `QuickXorHash verification passed: ${item.remotePath}`
-          : `QuickXorHash verification failed for ${item.remotePath}.`,
-      };
-    }
-
-    return {
-      ok: true,
-      cryptographic: false,
-      message: `No OneDrive hash was available; verified by size for ${item.remotePath}.`,
-    };
-  }
-
-  private async sha1File(filePath: string) {
-    const hash = createHash('sha1');
-    await pipeline(createReadStream(filePath), hash);
-    return hash.digest('hex').toUpperCase();
-  }
-
-  private async quickXorHashFile(filePath: string) {
-    const hash = new Uint8Array(20);
-    let length = 0;
-    for await (const chunk of createReadStream(filePath)) {
-      const bytes = chunk as Buffer;
-      for (let i = 0; i < bytes.length; i += 1) {
-        const bitOffset = ((length + i) * 11) % 160;
-        const byteOffset = Math.floor(bitOffset / 8);
-        const bitRemainder = bitOffset % 8;
-        hash[byteOffset] ^= bytes[i] << bitRemainder;
-        if (bitRemainder > 0) {
-          hash[(byteOffset + 1) % hash.length] ^= bytes[i] >> (8 - bitRemainder);
-        }
-      }
-      length += bytes.length;
-    }
-
-    const lengthBytes = new Uint8Array(8);
-    new DataView(lengthBytes.buffer).setBigUint64(0, BigInt(length), true);
-    for (let i = 0; i < lengthBytes.length; i += 1) {
-      hash[hash.length - lengthBytes.length + i] ^= lengthBytes[i];
-    }
-    return Buffer.from(hash).toString('base64');
-  }
-
-  private hashMatches(actual: string, expected: string) {
-    return actual.trim().toLowerCase() === expected.trim().toLowerCase();
-  }
-
-  private isValidQuickXorHash(value?: string) {
-    if (!value) return false;
-    try {
-      return Buffer.from(value, 'base64').length === 20;
-    } catch {
-      return false;
-    }
   }
 
   private async resolveFinalPath(item: RemoteItemMetadata, settings: DownloadSettings, job: ServerDownloadJob) {
     const requested = resolveInsideRoot(job.targetRoot, item.remotePath);
     if (settings.conflictStrategy === 'overwrite') return requested;
     try {
-    const existing = await fs.stat(requested);
+      const existing = await fs.stat(requested);
       if (settings.conflictStrategy === 'skip_existing') {
         if (existing.size === item.size) {
+          if (settings.verifyAfterDownload) {
+            const verification = await verifyServerFile(requested, item);
+            if (!verification.ok) {
+              this.log(job, `Existing file failed verification; redownloading: ${item.remotePath}`);
+              return requested;
+            }
+            this.log(job, `Skipped existing verified file: ${item.remotePath}`);
+          } else {
+            this.log(job, `Skipped existing file: ${item.remotePath}`);
+          }
           job.snapshot.summary.skipped += 1;
-          this.log(job, `Skipped existing file: ${item.remotePath}`);
           return null;
         }
         return requested;
@@ -694,6 +643,22 @@ export class ServerDownloadManager {
       }
     }
     throw new Error(`Unable to allocate conflict-free filename for ${item.remotePath}`);
+  }
+
+  private recordArchiveItem(
+    job: ServerDownloadJob,
+    item: RemoteItemMetadata,
+    localPath: string,
+    status: 'completed' | 'skipped',
+    verification?: ServerVerificationResult,
+  ) {
+    this.store?.upsertArchiveRecord({
+      userEmail: job.userEmail,
+      item,
+      localPath,
+      status,
+      verificationMessage: verification?.message,
+    });
   }
 
   private log(job: ServerDownloadJob, message: string) {

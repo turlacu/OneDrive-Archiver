@@ -84,3 +84,28 @@ test('marks active jobs interrupted and persists delta tokens', async () => {
     assert.equal(store.getDeltaToken('owner@example.com'), 'delta-link');
   });
 });
+
+test('persists server archive records for repair', async () => {
+  await withStore(store => {
+    store.upsertArchiveRecord({
+      userEmail: 'owner@example.com',
+      localPath: '/downloads/users/owner_example.com/Documents/report.txt',
+      status: 'completed',
+      verificationMessage: 'SHA-1 verification passed.',
+      item: {
+        driveId: 'me',
+        itemId: 'item-1',
+        name: 'report.txt',
+        remotePath: 'Documents/report.txt',
+        size: 4,
+        hashes: { sha1Hash: 'A9993E364706816ABA3E25717850C26C9CD0D89D' },
+      },
+    });
+
+    const records = store.listArchiveRecords('owner@example.com');
+    assert.equal(records.length, 1);
+    assert.equal(records[0].item.remotePath, 'Documents/report.txt');
+    assert.equal(records[0].verificationMessage, 'SHA-1 verification passed.');
+    assert.equal(store.listArchiveRecords('other@example.com').length, 0);
+  });
+});

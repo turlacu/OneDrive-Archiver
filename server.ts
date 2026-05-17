@@ -319,7 +319,7 @@ async function startServer() {
         const accessToken = await requireAccessToken(req, res);
         if (!accessToken) return;
         const selections = Array.isArray(req.body?.selections) ? req.body.selections : [];
-        if (mode !== 'incremental' && selections.length === 0) {
+        if (mode !== 'incremental' && mode !== 'repair' && selections.length === 0) {
             return res.status(400).json({ error: 'Select OneDrive files or folders before starting a server job.' });
         }
         const getAccessToken = async () => refreshSessionToken(req);
