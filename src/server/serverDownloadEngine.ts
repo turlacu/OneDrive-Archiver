@@ -419,12 +419,41 @@ export class ServerDownloadManager {
     if (!response.ok || !response.body) throw new Error(`HTTP ${response.status} while downloading ${item.name}.`);
     job.snapshot.currentFile = item.name;
     this.log(job, `Downloading ${item.remotePath}`);
-    await pipeline(Readable.fromWeb(response.body as any), createWriteStream(partialPath));
+    const startingDownloadedBytes = job.snapshot.downloadedBytes;
+    let currentFileBytes = 0;
+    let lastProgressAt = 0;
+    let lastSpeedAt = Date.now();
+    let lastSpeedBytes = startingDownloadedBytes;
+    const stream = Readable.fromWeb(response.body as any);
+    stream.on('data', (chunk: Buffer) => {
+      currentFileBytes += chunk.length;
+      job.snapshot.downloadedBytes = Math.min(startingDownloadedBytes + currentFileBytes, job.snapshot.totalBytes);
+      const now = Date.now();
+      const elapsedSeconds = (now - lastSpeedAt) / 1000;
+      if (elapsedSeconds >= 1) {
+        job.snapshot.speedBytesPerSecond = Math.max(0, (job.snapshot.downloadedBytes - lastSpeedBytes) / elapsedSeconds);
+        lastSpeedAt = now;
+        lastSpeedBytes = job.snapshot.downloadedBytes;
+      }
+      if (job.snapshot.totalBytes > 0) {
+        job.snapshot.stagePercent = Math.min((job.snapshot.downloadedBytes / job.snapshot.totalBytes) * 100, 100);
+      }
+      const remainingBytes = Math.max(job.snapshot.totalBytes - job.snapshot.downloadedBytes, 0);
+      job.snapshot.etaSeconds = job.snapshot.speedBytesPerSecond > 0
+        ? remainingBytes / job.snapshot.speedBytesPerSecond
+        : undefined;
+      if (now - lastProgressAt >= 1000) {
+        job.updatedAt = new Date().toISOString();
+        this.persist(job);
+        lastProgressAt = now;
+      }
+    });
+    await pipeline(stream, createWriteStream(partialPath));
     const stat = await fs.stat(partialPath);
     if (stat.size !== item.size) throw new Error(`Size mismatch for ${item.name}: expected ${item.size}, wrote ${stat.size}.`);
     await fs.rename(partialPath, finalPath);
     job.snapshot.completedFiles += 1;
-    job.snapshot.downloadedBytes = Math.min(job.snapshot.downloadedBytes + item.size, job.snapshot.totalBytes);
+    job.snapshot.downloadedBytes = Math.min(startingDownloadedBytes + item.size, job.snapshot.totalBytes);
     job.snapshot.stagePercent = job.snapshot.totalBytes > 0
       ? Math.min((job.snapshot.downloadedBytes / job.snapshot.totalBytes) * 100, 100)
       : 100;

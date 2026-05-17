@@ -17,47 +17,17 @@ interface FailedFile {
   reason: string;
 }
 
-interface ServerArchiveJob {
-  id: string;
-  mode: string;
-  status: string;
-  targetRoot: string;
-  log: string[];
-}
-
 interface ActivityLogProps {
   logs: LogEntry[];
   failedFiles: FailedFile[];
-  activeServerJob?: ServerArchiveJob;
   isSyncing: boolean;
   canRetry: boolean;
   onRetryFile: (id: string) => void;
 }
 
-export function ActivityLog({ logs, failedFiles, activeServerJob, isSyncing, canRetry, onRetryFile }: ActivityLogProps) {
+export function ActivityLog({ logs, failedFiles, isSyncing, canRetry, onRetryFile }: ActivityLogProps) {
   return (
     <div className="flex-1 border border-slate-200 dark:border-neutral-700 rounded overflow-hidden flex flex-col bg-white dark:bg-neutral-900">
-      {activeServerJob && (
-        <div className="border-b border-slate-200 dark:border-neutral-700 bg-slate-50 dark:bg-neutral-800 p-4">
-          <div className="flex items-center justify-between gap-3 mb-2">
-            <div className="min-w-0">
-              <div className="text-xs font-bold uppercase tracking-wide text-slate-700 dark:text-neutral-100">Server job</div>
-              <div className="text-[10px] text-slate-500 dark:text-neutral-400 break-words">{activeServerJob.targetRoot}</div>
-            </div>
-            <div className="shrink-0 text-right">
-              <div className="text-[9px] font-bold uppercase text-blue-600 dark:text-blue-400">{activeServerJob.status}</div>
-              <div className="text-[9px] uppercase text-slate-400 dark:text-neutral-500">{activeServerJob.mode}</div>
-            </div>
-          </div>
-          <div className="max-h-32 overflow-y-auto space-y-1 font-mono text-[10px] text-slate-600 dark:text-neutral-300">
-            {activeServerJob.log.length > 0 ? activeServerJob.log.map((line, index) => (
-              <div key={`${activeServerJob.id}-${index}`} className="break-words">{line}</div>
-            )) : (
-              <div className="text-slate-400 dark:text-neutral-500 italic">No server job log entries yet.</div>
-            )}
-          </div>
-        </div>
-      )}
       {failedFiles.length > 0 && (
         <div className="border-b border-red-100 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 p-4">
           <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-red-700 dark:text-red-300 mb-3">

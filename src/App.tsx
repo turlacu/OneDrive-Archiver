@@ -970,6 +970,7 @@ export default function App() {
     : Math.max(syncStats.total - syncStats.completed, 0);
   const activeStage = activeSnapshot?.status || (isSyncing || isServerBusy ? 'downloading' : 'idle');
   const activeStageLabel = activeStage.replaceAll('_', ' ');
+  const activeSpeed = targetMode === 'server' ? activeSnapshot?.speedBytesPerSecond || 0 : downloadSpeed;
   const activeStagePercent = Math.round(
     ['downloading', 'retrying', 'throttled'].includes(activeStage)
       ? globalProgress
@@ -983,6 +984,20 @@ export default function App() {
   const visibleItems = rootItems.slice(firstVisibleRow, firstVisibleRow + visibleRowCount);
   const topSpacerHeight = firstVisibleRow * rowHeight;
   const bottomSpacerHeight = Math.max(0, (rootItems.length - firstVisibleRow - visibleItems.length) * rowHeight);
+  const activeServerLogEntries: LogEntry[] = targetMode === 'server' && activeServerJob
+    ? activeServerJob.log.map((line, index) => {
+        const match = line.match(/^(\d{1,2}:\d{2}:\d{2}(?:\s+[AP]M)?)\s+(.+)$/i);
+        return {
+          id: `server-${activeServerJob.id}-${index}`,
+          time: match?.[1] || '',
+          stage: 'server',
+          message: match?.[2] || line,
+          jobName: activeServerJob.status,
+          jobPath: activeServerJob.targetRoot,
+        };
+      })
+    : [];
+  const visibleLogs = [...activeServerLogEntries, ...logs];
 
   return (
     <div className="flex flex-col h-screen w-full bg-slate-50 text-slate-900 font-sans overflow-hidden dark:bg-neutral-950 dark:text-neutral-100">
@@ -1289,9 +1304,8 @@ export default function App() {
               />
             ) : (
               <ActivityLog
-                logs={logs}
+                logs={visibleLogs}
                 failedFiles={failedFiles}
-                activeServerJob={targetMode === 'server' && activeServerJob ? activeServerJob : undefined}
                 isSyncing={isSyncing}
                 canRetry={Boolean(localDir)}
                 onRetryFile={id => retryFailedDownloads([id])}
@@ -1545,7 +1559,7 @@ export default function App() {
             </div>
             <div className="flex justify-between text-xs text-slate-600 dark:text-neutral-300 font-medium">
               <span>Download Speed:</span>
-              <span className="text-blue-600 dark:text-blue-400 italic">{isSyncing ? formatSpeed(downloadSpeed) : '0.00KB/s'}</span>
+              <span className="text-blue-600 dark:text-blue-400 italic">{isSyncing || isServerBusy ? formatSpeed(activeSpeed) : '0.00KB/s'}</span>
             </div>
             <div className="flex justify-between text-xs mt-2 text-slate-600 dark:text-neutral-300 font-medium">
               <span>ETA:</span>
